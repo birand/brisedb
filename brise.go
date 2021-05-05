@@ -71,5 +71,17 @@ func (ts *TransactionStack) Commit() {
 	// TODO: write data to file to make it persist to disk
 	// Tip: serialize map data to JSON
 }
+
+/* RollBackTransaction clears all keys SET within a transaction */
+func (ts *TransactionStack) RollBackTransaction() {
+	if ts.top == nil {
+		fmt.Printf("ERROR: No Active Transaction\n")
+	} else {
+		for key := range ts.top.store {
+			delete(ts.top.store.key)
+		}
+	}
+}
+
 func main() {
 }
