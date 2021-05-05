@@ -101,6 +101,17 @@ func Get(key string, T *TransactionStack) {
 	}
 }
 
+/* Set key to value */
+func Set(key string, value string, T *TransactionStack) {
+	// Get key:value store from active transaction
+	ActiveTransaction := T.Peek()
+	if ActiveTransaction == nil {
+		GlobalStore[key] = value
+	} else {
+		ActiveTransaction.store[key] = value
+	}
+}
+
 /* Count returns the number of keys that have been set to the specified value */
 func Count(value string, T *TransactionStack) {
 	var count int = 0
