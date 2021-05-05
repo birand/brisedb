@@ -101,5 +101,25 @@ func Get(key string, T *TransactionStack) {
 	}
 }
 
+/* Count returns the number of keys that have been set to the specified value */
+func Count(value string, T *TransactionStack) {
+	var count int = 0
+	ActiveTransaction := T.Peek()
+	if ActiveTransaction == nil {
+		for _, v := range GlobalStore {
+			if v == value {
+				count++
+			}
+		}
+	} else {
+		for _, v := range ActiveTransaction.store {
+			if v == value {
+				count++
+			}
+		}
+	}
+	fmt.Println(count)
+}
+
 func main() {
 }
