@@ -121,5 +121,16 @@ func Count(value string, T *TransactionStack) {
 	fmt.Println(count)
 }
 
+/* Delete value from Store */
+func Delete(key string, T *TransactionStack) {
+	ActiveTransaction := T.Peek()
+	if ActiveTransaction == nil {
+		delete(GlobalStore, key)
+	} else {
+		delete(ActiveTransaction.store, key)
+	}
+	fmt.Println(key, "deleted")
+}
+
 func main() {
 }
