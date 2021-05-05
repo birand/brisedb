@@ -78,7 +78,7 @@ func (ts *TransactionStack) RollBackTransaction() {
 		fmt.Printf("ERROR: No Active Transaction\n")
 	} else {
 		for key := range ts.top.store {
-			delete(ts.top.store.key)
+			delete(ts.top.store, key)
 		}
 	}
 }
@@ -133,4 +133,35 @@ func Delete(key string, T *TransactionStack) {
 }
 
 func main() {
+	reader := bufio.NewReader(os.Stdin)
+	items := &TransactionStack{}
+	for {
+		fmt.Printf("> ")
+		text, _ := reader.ReadString("\n")
+		// split the text into operation strings
+		operation := strings.Fields(text)
+		switch operation[0] {
+		case "BEGIN":
+			items.PushTransaction()
+		case "ROLLBACK":
+			items.RollBackTransaction()
+		case "COMMIT":
+			items.Commit()
+			items.PopTransaction()
+		case "END":
+			items.PopTransaction()
+		case "SET":
+			Set(operation[1], operation[2], items)
+		case "GET":
+			Get(operation[1], items)
+		case "DELETE":
+			Delete(operation[1], items)
+		case "COUNT":
+			Count(operation[1], items)
+		case "STOP":
+			os.Exit(0)
+		default:
+			fmt.Printf("ERROR: Unrecognized Operation %s\n", operation[0])
+		}
+	}
 }
