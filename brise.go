@@ -83,5 +83,23 @@ func (ts *TransactionStack) RollBackTransaction() {
 	}
 }
 
+/* Get value of key from Store */
+func Get(key string, T *TransactionStack) {
+	ActiveTransaction := T.Peek()
+	if ActiveTransaction == nil {
+		if val, ok := GlobalStore[key]; ok {
+			fmt.Printf("%s\n", val)
+		} else {
+			fmt.Printf("%s not set\n", key)
+		}
+	} else {
+		if val, ok := ActiveTransaction.store[key]; ok {
+			fmt.Printf("%s\n", val)
+		} else {
+			fmt.Printf("%s not set\n", key)
+		}
+	}
+}
+
 func main() {
 }
