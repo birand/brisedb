@@ -137,7 +137,7 @@ func main() {
 	items := &TransactionStack{}
 	for {
 		fmt.Printf("> ")
-		text, _ := reader.ReadString("\n")
+		text, _ := reader.ReadString('\n')
 		// split the text into operation strings
 		operation := strings.Fields(text)
 		switch operation[0] {
