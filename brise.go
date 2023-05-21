@@ -2,7 +2,9 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"os"
 	"strings"
 )
@@ -51,7 +53,9 @@ func (ts *TransactionStack) Peek() *Transaction {
 	return ts.top
 }
 
-/* Commit write(SET) changes to the store with TransactionStack scope
+/*
+	Commit write(SET) changes to the store with TransactionStack scope
+
 Also write cahnges to disk/file,
 if data needs to persist after the shell closes
 */
@@ -68,8 +72,21 @@ func (ts *TransactionStack) Commit() {
 	} else {
 		fmt.Printf("INFO: Nothing ot commit\n")
 	}
-	// TODO: write data to file to make it persist to disk
-	// Tip: serialize map data to JSON
+	// Serialize GlobalStore data to JSON
+	data, err := json.Marshal(GlobalStore)
+	if err != nil {
+		fmt.Printf("ERROR: Failed to serialize data to JSON: %v\n", err)
+		return
+	}
+
+	// Write data to file
+	err = ioutil.WriteFile("data.json", data, 0644)
+	if err != nil {
+		fmt.Printf("ERROR: Failed to write data to file: %v\n", err)
+		return
+	}
+
+	fmt.Println("INFO: Data written to file")
 }
 
 /* RollBackTransaction clears all keys SET within a transaction */
