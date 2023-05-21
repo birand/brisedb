@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"os"
 	"strings"
 )
@@ -38,10 +39,10 @@ func (ts *TransactionStack) PushTransaction() {
 
 /* PopTransaction deletes a transaction from stack */
 func (ts *TransactionStack) PopTransaction() {
-	// Pop the Transaciton from the stack, no longer active
+	// Pop the Transaction from the stack, no longer active
 	if ts.top == nil {
 		// basically stack underflow
-		fmt.Printf("ERROR: No Active Transactions\n")
+		log.Println("ERROR: No Active Transactions")
 	} else {
 		ts.top = ts.top.next
 		ts.size--
@@ -54,9 +55,9 @@ func (ts *TransactionStack) Peek() *Transaction {
 }
 
 /*
-	Commit write(SET) changes to the store with TransactionStack scope
+Commit write(SET) changes to the store with TransactionStack scope
 
-Also write cahnges to disk/file,
+Also write changes to disk/file,
 if data needs to persist after the shell closes
 */
 func (ts *TransactionStack) Commit() {
@@ -70,29 +71,30 @@ func (ts *TransactionStack) Commit() {
 			}
 		}
 	} else {
-		fmt.Printf("INFO: Nothing ot commit\n")
+		log.Println("INFO: Nothing to commit")
 	}
+
 	// Serialize GlobalStore data to JSON
 	data, err := json.Marshal(GlobalStore)
 	if err != nil {
-		fmt.Printf("ERROR: Failed to serialize data to JSON: %v\n", err)
+		log.Printf("ERROR: Failed to serialize data to JSON: %v", err)
 		return
 	}
 
 	// Write data to file
 	err = ioutil.WriteFile("data.json", data, 0644)
 	if err != nil {
-		fmt.Printf("ERROR: Failed to write data to file: %v\n", err)
+		log.Printf("ERROR: Failed to write data to file: %v", err)
 		return
 	}
 
-	fmt.Println("INFO: Data written to file")
+	log.Println("INFO: Data written to file")
 }
 
 /* RollBackTransaction clears all keys SET within a transaction */
 func (ts *TransactionStack) RollBackTransaction() {
 	if ts.top == nil {
-		fmt.Printf("ERROR: No Active Transaction\n")
+		log.Println("ERROR: No Active Transaction")
 	} else {
 		for key := range ts.top.store {
 			delete(ts.top.store, key)
@@ -106,15 +108,14 @@ func Get(key string, T *TransactionStack) {
 	if ActiveTransaction == nil {
 		if val, ok := GlobalStore[key]; ok {
 			fmt.Printf("%s\n", val)
-		} else {
-			fmt.Printf("%s not set\n", key)
+			return
 		}
+	}
+
+	if val, ok := GlobalStore[key]; ok {
+		fmt.Printf("%s\n", val)
 	} else {
-		if val, ok := ActiveTransaction.store[key]; ok {
-			fmt.Printf("%s\n", val)
-		} else {
-			fmt.Printf("%s not set\n", key)
-		}
+		fmt.Printf("%s not set\n", key)
 	}
 }
 
@@ -131,19 +132,19 @@ func Set(key string, value string, T *TransactionStack) {
 
 /* Count returns the number of keys that have been set to the specified value */
 func Count(value string, T *TransactionStack) {
-	var count int = 0
+	var count int
 	ActiveTransaction := T.Peek()
-	if ActiveTransaction == nil {
-		for _, v := range GlobalStore {
-			if v == value {
+	if ActiveTransaction != nil {
+		for _, val := range ActiveTransaction.store {
+			if val == value {
 				count++
 			}
 		}
-	} else {
-		for _, v := range ActiveTransaction.store {
-			if v == value {
-				count++
-			}
+	}
+
+	for _, val := range GlobalStore {
+		if val == value {
+			count++
 		}
 	}
 	fmt.Println(count)
@@ -179,17 +180,33 @@ func main() {
 		case "END":
 			items.PopTransaction()
 		case "SET":
+			if len(operation) < 3 {
+				log.Println("ERROR: Missing key or value argument for SET")
+				continue
+			}
 			Set(operation[1], operation[2], items)
 		case "GET":
+			if len(operation) < 2 {
+				log.Println("ERROR: Missing key argument for GET")
+				continue
+			}
 			Get(operation[1], items)
 		case "DELETE":
+			if len(operation) < 2 {
+				log.Println("ERROR: Missing key argument for DELETE")
+				continue
+			}
 			Delete(operation[1], items)
 		case "COUNT":
+			if len(operation) < 2 {
+				log.Println("ERROR: Missing value argument for COUNT")
+				continue
+			}
 			Count(operation[1], items)
 		case "STOP":
 			os.Exit(0)
 		default:
-			fmt.Printf("ERROR: Unrecognized Operation %s\n", operation[0])
+			log.Printf("ERROR: Unrecognized Operation %s\n", operation[0])
 		}
 	}
 }
