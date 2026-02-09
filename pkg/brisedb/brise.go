@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sync"
 )
 
 /* Map string:string */
@@ -12,6 +13,7 @@ type Map = map[string]string
 
 // BriseDB encapsulates the database state
 type BriseDB struct {
+	mu           sync.RWMutex
 	store        map[string]string
 	valueCounts  map[string]int
 	transactions *TransactionStack
@@ -116,6 +118,8 @@ func (ts *TransactionStack) Peek() *Transaction {
 
 // BeginTransaction starts a new transaction.
 func (db *BriseDB) BeginTransaction() {
+	db.mu.Lock()
+	defer db.mu.Unlock()
 	db.transactions.PushTransaction()
 }
 
@@ -123,6 +127,8 @@ func (db *BriseDB) BeginTransaction() {
 Commit write(SET) changes to the store with TransactionStack scope
 */
 func (db *BriseDB) CommitTransaction() error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
 	ActiveTransaction := db.transactions.Peek()
 	if ActiveTransaction == nil {
 		return fmt.Errorf("INFO: Nothing to commit")
@@ -162,16 +168,22 @@ func (db *BriseDB) CommitTransaction() error {
 
 /* RollBackTransaction clears all keys SET within a transaction */
 func (db *BriseDB) RollbackTransaction() error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
 	return db.transactions.PopTransaction()
 }
 
 // PopTransaction removes the current transaction from the stack.
 func (db *BriseDB) PopTransaction() error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
 	return db.transactions.PopTransaction()
 }
 
 /* Get value of key from Store */
 func (db *BriseDB) Get(key string) (string, bool) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
 	// Search in transaction stores first
 	tx := db.transactions.Peek()
 	for tx != nil {
@@ -189,11 +201,13 @@ func (db *BriseDB) Get(key string) (string, bool) {
 }
 
 /* Set key to value */
-func (db *BriseDB) Set(key string, value string) {
+func (db *BriseDB) Set(key string, value string) error {
 	ActiveTransaction := db.transactions.Peek()
 	if ActiveTransaction != nil {
 		ActiveTransaction.store[key] = value
 	} else {
+		db.mu.Lock()
+		defer db.mu.Unlock()
 		// If the key already exists, decrement the count of the old value
 		if oldValue, ok := db.store[key]; ok {
 			db.valueCounts[oldValue]--
@@ -209,28 +223,31 @@ func (db *BriseDB) Set(key string, value string) {
 
 		data, err := json.Marshal(op)
 		if err != nil {
-			// What to do here? Log and continue?
-			return
+			return fmt.Errorf("failed to marshal WAL entry: %w", err)
 		}
 
 		if _, err := db.walFile.Write(append(data, '\n')); err != nil {
-			// What to do here? Log and continue?
-			return
+			return fmt.Errorf("failed to write to WAL file: %w", err)
 		}
 	}
+	return nil
 }
 
 /* Count returns the number of keys that have been set to the specified value */
 func (db *BriseDB) Count(value string) int {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
 	return db.valueCounts[value]
 }
 
 /* Delete value from Store */
-func (db *BriseDB) Delete(key string) {
+func (db *BriseDB) Delete(key string) error {
 	ActiveTransaction := db.transactions.Peek()
 	if ActiveTransaction != nil {
 		delete(ActiveTransaction.store, key)
 	} else {
+		db.mu.Lock()
+		defer db.mu.Unlock()
 		if oldValue, ok := db.store[key]; ok {
 			db.valueCounts[oldValue]--
 		}
@@ -243,13 +260,12 @@ func (db *BriseDB) Delete(key string) {
 
 		data, err := json.Marshal(op)
 		if err != nil {
-			// What to do here? Log and continue?
-			return
+			return fmt.Errorf("failed to marshal WAL entry: %w", err)
 		}
 
 		if _, err := db.walFile.Write(append(data, '\n')); err != nil {
-			// What to do here? Log and continue?
-			return
+			return fmt.Errorf("failed to write to WAL file: %w", err)
 		}
 	}
+	return nil
 }

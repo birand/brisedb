@@ -55,7 +55,7 @@ func executeCommand(db *brisedb.BriseDB, command string, args []string) error {
 		if len(args) < 2 {
 			return fmt.Errorf("ERROR: Missing key or value argument for SET")
 		}
-		db.Set(args[0], args[1])
+		return db.Set(args[0], args[1])
 	case "GET":
 		if len(args) < 1 {
 			return fmt.Errorf("ERROR: Missing key argument for GET")
@@ -69,7 +69,7 @@ func executeCommand(db *brisedb.BriseDB, command string, args []string) error {
 		if len(args) < 1 {
 			return fmt.Errorf("ERROR: Missing key argument for DELETE")
 		}
-		db.Delete(args[0])
+		return db.Delete(args[0])
 	case "COUNT":
 		if len(args) < 1 {
 			return fmt.Errorf("ERROR: Missing value argument for COUNT")
