@@ -1,7 +1,9 @@
 """brisedb Python client — line-based TCP protocol."""
 
+import queue
 import socket
 import threading
+from dataclasses import dataclass, field
 
 
 class BriseDBError(Exception):
@@ -88,6 +90,10 @@ class Client:
         """Remove the TTL from *key*.  Returns ``True`` if a TTL was removed."""
         return self._cmd("PERSIST", key) == "1"
 
+    def publish(self, channel: str, message: str) -> int:
+        """Publish *message* to *channel*. Returns the number of receivers."""
+        return int(self._cmd("PUBLISH", channel, message))
+
     def compact(self) -> None:
         """Rewrite the server WAL to contain only live keys."""
         self._cmd("COMPACT")
@@ -136,6 +142,123 @@ class Client:
         if resp.startswith("-"):
             raise BriseDBError(resp[1:])
         raise BriseDBError(f"malformed response: {resp!r}")
+
+
+@dataclass
+class PubSubMessage:
+    """A message received over a pub/sub connection.
+
+    kind    — "subscribe", "unsubscribe", or "message"
+    channel — the channel name
+    payload — the message body (only set for kind == "message")
+    count   — active subscription count (set for subscribe/unsubscribe)
+    """
+    kind: str
+    channel: str
+    payload: str = ""
+    count: int = 0
+
+
+class PubSubConn:
+    """Dedicated connection for pub/sub.
+
+    Must not be used for regular key-value commands.
+
+    Usage::
+
+        with brisedb.PubSubConn("localhost", 6380) as ps:
+            ps.subscribe("news", "sports")
+            for msg in ps:            # blocks until Close()
+                if msg.kind == "message":
+                    print(msg.channel, msg.payload)
+    """
+
+    def __init__(self, host: str = "localhost", port: int = 6380):
+        self._sock = socket.create_connection((host, port))
+        self._file = self._sock.makefile("r", encoding="utf-8")
+        self._wlock = threading.Lock()
+        self._queue: queue.Queue[PubSubMessage | None] = queue.Queue(maxsize=256)
+        self._thread = threading.Thread(target=self._read_loop, daemon=True)
+        self._thread.start()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+    def __iter__(self):
+        """Yield PubSubMessage objects until the connection is closed."""
+        while True:
+            msg = self._queue.get()
+            if msg is None:
+                break
+            yield msg
+
+    def subscribe(self, *channels: str) -> None:
+        """Subscribe to one or more channels."""
+        self._send("SUBSCRIBE", *channels)
+
+    def unsubscribe(self, *channels: str) -> None:
+        """Unsubscribe from channels. No args = unsubscribe from all."""
+        self._send("UNSUBSCRIBE", *channels)
+
+    def messages(self):
+        """Iterator over incoming PubSubMessage objects (same as iterating the conn)."""
+        return iter(self)
+
+    def poll(self, timeout: float | None = None) -> "PubSubMessage | None":
+        """Return the next message, or ``None`` if *timeout* seconds elapse.
+
+        Useful for checking whether a message arrived without blocking forever.
+        """
+        try:
+            msg = self._queue.get(timeout=timeout)
+            return msg  # may be None sentinel on connection close
+        except queue.Empty:
+            return None
+
+    def close(self) -> None:
+        """Close the connection."""
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+
+    def _send(self, cmd: str, *args: str) -> None:
+        line = " ".join([cmd, *args]) + "\n"
+        with self._wlock:
+            self._sock.sendall(line.encode("utf-8"))
+
+    def _read_loop(self) -> None:
+        try:
+            for line in self._file:
+                line = line.rstrip("\n")
+                msg = self._parse(line)
+                if msg:
+                    self._queue.put(msg)
+        except OSError:
+            pass
+        finally:
+            self._queue.put(None)  # sentinel
+
+    @staticmethod
+    def _parse(line: str) -> PubSubMessage | None:
+        if not line.startswith("+"):
+            return None
+        parts = line[1:].split(" ", 2)
+        if not parts:
+            return None
+        kind = parts[0].lower()
+        if kind == "message" and len(parts) == 3:
+            return PubSubMessage(kind="message", channel=parts[1], payload=parts[2])
+        if kind in ("subscribe", "unsubscribe") and len(parts) == 3:
+            try:
+                count = int(parts[2])
+            except ValueError:
+                count = 0
+            return PubSubMessage(kind=kind, channel=parts[1], count=count)
+        return None
 
 
 class _Transaction:

@@ -27,6 +27,7 @@ type BriseDB struct {
 	store       map[string]string
 	valueCounts map[string]int
 	expiry      map[string]time.Time // keys with a TTL
+	pubsub      *PubSub
 	walFile     *os.File
 	walPath     string
 	stopCh      chan struct{}
@@ -43,6 +44,7 @@ func NewBriseDB(walPath string) (*BriseDB, error) {
 		store:       make(map[string]string),
 		valueCounts: make(map[string]int),
 		expiry:      make(map[string]time.Time),
+		pubsub:      newPubSub(),
 		walFile:     walFile,
 		walPath:     walPath,
 		stopCh:      make(chan struct{}),
@@ -56,6 +58,9 @@ func NewBriseDB(walPath string) (*BriseDB, error) {
 
 	return db, nil
 }
+
+// PubSub returns the shared pub/sub manager.
+func (db *BriseDB) PubSub() *PubSub { return db.pubsub }
 
 // NewSession creates a new Session backed by this database.
 func (db *BriseDB) NewSession() *Session {

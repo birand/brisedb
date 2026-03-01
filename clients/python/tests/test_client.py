@@ -1,5 +1,6 @@
 """Integration tests for the brisedb Python client."""
 
+import queue
 import time
 import threading
 
@@ -167,6 +168,147 @@ def test_unknown_command_raises(client):
 # ------------------------------------------------------------------ #
 # Concurrency
 # ------------------------------------------------------------------ #
+
+# ------------------------------------------------------------------ #
+# Pub/Sub
+# ------------------------------------------------------------------ #
+
+def collect_msg(ps, kind, timeout=2.0):
+    """Return the first message of *kind* from PubSubConn, or raise."""
+    deadline = time.monotonic() + timeout
+    for msg in ps:
+        if msg.kind == kind:
+            return msg
+        if time.monotonic() > deadline:
+            break
+    raise TimeoutError(f"timed out waiting for {kind!r} message")
+
+
+def test_publish_no_subscribers(client):
+    assert client.publish("news", "hello") == 0
+
+
+def test_pubsub_subscribe_and_receive(server):
+    host, port = server
+    received = queue.Queue()
+
+    def subscriber():
+        with brisedb.PubSubConn(host, port) as ps:
+            ps.subscribe("news")
+            for msg in ps:
+                if msg.kind == "subscribe":
+                    received.put(("subscribed", msg.count))
+                    break
+            for msg in ps:
+                if msg.kind == "message":
+                    received.put(("message", msg.channel, msg.payload))
+                    break
+
+    t = threading.Thread(target=subscriber, daemon=True)
+    t.start()
+
+    # Wait for subscription confirmation
+    event = received.get(timeout=2)
+    assert event == ("subscribed", 1)
+
+    with brisedb.Client(host, port) as pub:
+        n = pub.publish("news", "hello")
+    assert n == 1
+
+    event = received.get(timeout=2)
+    assert event == ("message", "news", "hello")
+    t.join(timeout=2)
+
+
+def test_pubsub_multiple_subscribers(server):
+    host, port = server
+    received = [queue.Queue(), queue.Queue()]
+
+    def make_subscriber(q):
+        def run():
+            with brisedb.PubSubConn(host, port) as ps:
+                ps.subscribe("sport")
+                for msg in ps:
+                    if msg.kind == "subscribe":
+                        break
+                for msg in ps:
+                    if msg.kind == "message":
+                        q.put(msg.payload)
+                        break
+        return run
+
+    threads = [threading.Thread(target=make_subscriber(q), daemon=True) for q in received]
+    for t in threads:
+        t.start()
+    time.sleep(0.1)  # let both subscribe
+
+    with brisedb.Client(host, port) as pub:
+        n = pub.publish("sport", "goal")
+    assert n == 2
+
+    for q in received:
+        assert q.get(timeout=2) == "goal"
+    for t in threads:
+        t.join(timeout=2)
+
+
+def test_pubsub_unsubscribe(server):
+    host, port = server
+    with brisedb.PubSubConn(host, port) as ps:
+        ps.subscribe("news")
+        for msg in ps:
+            if msg.kind == "subscribe":
+                break
+
+        ps.unsubscribe("news")
+        for msg in ps:
+            if msg.kind == "unsubscribe":
+                assert msg.channel == "news"
+                assert msg.count == 0
+                break
+
+        with brisedb.Client(host, port) as pub:
+            n = pub.publish("news", "late")
+        assert n == 0
+
+
+def test_pubsub_isolated_channels(server):
+    host, port = server
+    sports_q = queue.Queue()
+
+    def sports_subscriber():
+        with brisedb.PubSubConn(host, port) as ps:
+            ps.subscribe("sport")
+            for msg in ps:
+                if msg.kind == "subscribe":
+                    sports_q.put("ready")
+                    break
+            for msg in ps:
+                if msg.kind == "message":
+                    sports_q.put(msg.payload)
+                    break
+
+    t = threading.Thread(target=sports_subscriber, daemon=True)
+    t.start()
+    assert sports_q.get(timeout=2) == "ready"
+
+    with brisedb.PubSubConn(host, port) as news_ps:
+        news_ps.subscribe("news")
+        for msg in news_ps:
+            if msg.kind == "subscribe":
+                break
+
+        with brisedb.Client(host, port) as pub:
+            pub.publish("sport", "goal")
+
+        # news subscriber should NOT receive a message — poll with short timeout
+        msg = news_ps.poll(timeout=0.2)
+        assert msg is None or msg.kind != "message", \
+            f"news got unexpected message: {msg}"
+
+    assert sports_q.get(timeout=2) == "goal"
+    t.join(timeout=2)
+
 
 def test_concurrent_clients(server):
     host, port = server

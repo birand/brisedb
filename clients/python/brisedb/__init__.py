@@ -1,3 +1,3 @@
-from .client import BriseDBError, Client
+from .client import BriseDBError, Client, PubSubConn, PubSubMessage
 
-__all__ = ["Client", "BriseDBError"]
+__all__ = ["Client", "BriseDBError", "PubSubConn", "PubSubMessage"]

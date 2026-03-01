@@ -121,6 +121,20 @@ func (c *Client) Persist(key string) (bool, error) {
 	return raw == "1", nil
 }
 
+// Publish sends payload to all subscribers of channel.
+// Returns the number of subscribers that received the message.
+func (c *Client) Publish(channel, payload string) (int, error) {
+	raw, err := c.do("PUBLISH", channel, payload)
+	if err != nil {
+		return 0, err
+	}
+	var n int
+	if _, err := fmt.Sscan(raw, &n); err != nil {
+		return 0, fmt.Errorf("brisedb: unexpected PUBLISH response %q", raw)
+	}
+	return n, nil
+}
+
 // Compact rewrites the server's WAL with only the current committed state.
 func (c *Client) Compact() error {
 	_, err := c.do("COMPACT")

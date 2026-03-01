@@ -58,14 +58,45 @@ func (s *Server) Addr() string {
 
 func (s *Server) handleConn(conn net.Conn) {
 	defer conn.Close()
+
 	session := s.db.NewSession()
+	ps := s.db.PubSub()
+
+	// msgCh receives pub/sub messages for this connection.
+	msgCh := make(chan brisedb.Message, 256)
+	// done signals the message-forwarder goroutine to stop.
+	done := make(chan struct{})
+
+	// subChannels tracks which channels this connection is subscribed to.
+	subChannels := make(map[string]bool)
+
 	scanner := bufio.NewScanner(conn)
 	w := bufio.NewWriter(conn)
+	var wmu sync.Mutex
 
 	respond := func(msg string) {
+		wmu.Lock()
 		fmt.Fprintf(w, "%s\n", msg)
 		w.Flush()
+		wmu.Unlock()
 	}
+
+	// Forwarder: pushes received pub/sub messages to the client.
+	go func() {
+		for {
+			select {
+			case msg := <-msgCh:
+				respond(fmt.Sprintf("+MESSAGE %s %s", msg.Channel, msg.Payload))
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	defer func() {
+		ps.UnsubscribeAll(msgCh)
+		close(done)
+	}()
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -143,6 +174,39 @@ func (s *Server) handleConn(conn net.Conn) {
 			} else {
 				respond("+0")
 			}
+		case "SUBSCRIBE":
+			if len(args) < 1 {
+				respond("-ERROR: SUBSCRIBE requires at least one channel")
+				continue
+			}
+			for _, ch := range args {
+				if !subChannels[ch] {
+					ps.Subscribe(msgCh, ch)
+					subChannels[ch] = true
+				}
+				respond(fmt.Sprintf("+SUBSCRIBE %s %d", ch, len(subChannels)))
+			}
+		case "UNSUBSCRIBE":
+			channels := args
+			if len(channels) == 0 {
+				// unsubscribe from all
+				for ch := range subChannels {
+					channels = append(channels, ch)
+				}
+			}
+			for _, ch := range channels {
+				if subChannels[ch] {
+					ps.Unsubscribe(msgCh, ch)
+					delete(subChannels, ch)
+				}
+				respond(fmt.Sprintf("+UNSUBSCRIBE %s %d", ch, len(subChannels)))
+			}
+		case "PUBLISH":
+			if len(args) < 2 {
+				respond("-ERROR: PUBLISH requires channel and message")
+				continue
+			}
+			respond(fmt.Sprintf("+%d", ps.Publish(args[0], args[1])))
 		case "BEGIN":
 			session.BeginTransaction()
 			respond("+OK")
