@@ -2,6 +2,7 @@ package brisedb
 
 import (
 	"testing"
+	"time"
 )
 
 func setupTestDB(t *testing.T) (*BriseDB, *Session, func()) {
@@ -178,4 +179,122 @@ func TestCountInTransaction(t *testing.T) {
 	}
 
 	session.RollbackTransaction()
+}
+
+func TestTTL_BasicExpiry(t *testing.T) {
+	_, session, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	session.SetEX("k", "v", 50*time.Millisecond)
+
+	// Key is visible before expiry
+	val, ok := session.Get("k")
+	if !ok || val != "v" {
+		t.Fatalf("expected key before expiry, got (%q, %v)", val, ok)
+	}
+
+	time.Sleep(60 * time.Millisecond)
+
+	// Lazy expiry: Get should report the key as absent
+	_, ok = session.Get("k")
+	if ok {
+		t.Error("expected key to be expired, but Get returned true")
+	}
+}
+
+func TestTTL_TTLMethod(t *testing.T) {
+	_, session, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	// Key not found → -2
+	if got := session.TTL("missing"); got != -2 {
+		t.Errorf("TTL missing key: want -2, got %d", got)
+	}
+
+	// Key with no expiry → -1
+	session.Set("persist", "yes")
+	if got := session.TTL("persist"); got != -1 {
+		t.Errorf("TTL no-expiry key: want -1, got %d", got)
+	}
+
+	// Key with TTL → positive seconds
+	session.SetEX("temp", "x", 10*time.Second)
+	ttl := session.TTL("temp")
+	if ttl <= 0 || ttl > 10 {
+		t.Errorf("TTL with expiry: want 1-10, got %d", ttl)
+	}
+}
+
+func TestTTL_Persist(t *testing.T) {
+	_, session, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	session.SetEX("k", "v", 10*time.Second)
+	if got := session.TTL("k"); got <= 0 {
+		t.Fatalf("expected positive TTL, got %d", got)
+	}
+
+	session.Persist("k")
+
+	if got := session.TTL("k"); got != -1 {
+		t.Errorf("after Persist: want -1, got %d", got)
+	}
+}
+
+func TestTTL_SetClearsTTL(t *testing.T) {
+	_, session, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	session.SetEX("k", "v1", 10*time.Second)
+	session.Set("k", "v2") // plain Set should clear the TTL
+
+	if got := session.TTL("k"); got != -1 {
+		t.Errorf("Set should clear TTL: want -1, got %d", got)
+	}
+}
+
+func TestTTL_WALPersistence(t *testing.T) {
+	walPath := t.TempDir() + "/wal.log"
+
+	db, err := NewBriseDB(walPath)
+	if err != nil {
+		t.Fatalf("NewBriseDB: %v", err)
+	}
+	s := db.NewSession()
+	s.SetEX("alive", "yes", 10*time.Second)
+	s.SetEX("dead", "no", 1*time.Millisecond)
+	time.Sleep(10 * time.Millisecond)
+	db.Close()
+
+	db2, err := NewBriseDB(walPath)
+	if err != nil {
+		t.Fatalf("NewBriseDB reload: %v", err)
+	}
+	defer db2.Close()
+	s2 := db2.NewSession()
+
+	if val, ok := s2.Get("alive"); !ok || val != "yes" {
+		t.Errorf("non-expired key after reload: want yes, got (%q, %v)", val, ok)
+	}
+	if _, ok := s2.Get("dead"); ok {
+		t.Error("expired key should not be present after reload")
+	}
+}
+
+func TestTTL_CountExcludesExpired(t *testing.T) {
+	_, session, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	session.Set("a", "foo")
+	session.SetEX("b", "foo", 50*time.Millisecond)
+
+	if got := session.Count("foo"); got != 2 {
+		t.Fatalf("before expiry: want 2, got %d", got)
+	}
+
+	time.Sleep(60 * time.Millisecond)
+
+	if got := session.Count("foo"); got != 1 {
+		t.Errorf("after expiry: want 1, got %d", got)
+	}
 }

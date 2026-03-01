@@ -5,8 +5,10 @@ import (
 	"bufio"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Client is a connection to a brisedb server. Safe for concurrent use.
@@ -83,6 +85,40 @@ func (c *Client) Commit() error {
 func (c *Client) Rollback() error {
 	_, err := c.do("ROLLBACK")
 	return err
+}
+
+// SetEX sets key to value with an expiry after ttl elapses.
+func (c *Client) SetEX(key, value string, ttl time.Duration) error {
+	secs := int64(ttl.Seconds())
+	if secs <= 0 {
+		secs = 1
+	}
+	_, err := c.do("SET", key, value, "EX", strconv.FormatInt(secs, 10))
+	return err
+}
+
+// TTL returns the remaining lifetime of key in seconds.
+// Returns -1 if the key has no expiry, -2 if the key does not exist or has expired.
+func (c *Client) TTL(key string) (int64, error) {
+	raw, err := c.do("TTL", key)
+	if err != nil {
+		return 0, err
+	}
+	n, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("brisedb: unexpected TTL response %q", raw)
+	}
+	return n, nil
+}
+
+// Persist removes the TTL from key, making it persist indefinitely.
+// Returns true if the key existed and had a TTL removed.
+func (c *Client) Persist(key string) (bool, error) {
+	raw, err := c.do("PERSIST", key)
+	if err != nil {
+		return false, err
+	}
+	return raw == "1", nil
 }
 
 // Compact rewrites the server's WAL with only the current committed state.

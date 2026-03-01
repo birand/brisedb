@@ -1,8 +1,8 @@
 package brisedb
 
 import (
-	"encoding/json"
 	"fmt"
+	"time"
 )
 
 // Session holds per-connection transaction state while sharing the underlying BriseDB.
@@ -37,6 +37,9 @@ func (s *Session) CommitTransaction() error {
 			delete(active.next.store, key)
 			active.next.deleted[key] = true
 		}
+		for key, exp := range active.expiry {
+			active.next.expiry[key] = exp
+		}
 	} else {
 		// Merge into main store
 		for key, value := range active.store {
@@ -46,17 +49,22 @@ func (s *Session) CommitTransaction() error {
 			s.db.store[key] = value
 			s.db.valueCounts[value]++
 
-			op := struct {
-				Type  string
-				Key   string
-				Value string
-			}{"SET", key, value}
-			data, err := json.Marshal(op)
-			if err != nil {
-				return fmt.Errorf("failed to marshal WAL entry: %w", err)
+			// Apply expiry change for this key
+			op := walEntry{Type: "SET", Key: key, Value: value}
+			if exp, ok := active.expiry[key]; ok {
+				if exp.IsZero() {
+					delete(s.db.expiry, key)
+				} else {
+					s.db.expiry[key] = exp
+					op.ExpiresAt = exp.Unix()
+				}
+			} else {
+				// No expiry change — clear any existing expiry (plain Set)
+				delete(s.db.expiry, key)
 			}
-			if _, err := s.db.walFile.Write(append(data, '\n')); err != nil {
-				return fmt.Errorf("failed to write to WAL file: %w", err)
+
+			if err := s.db.writeWAL(op); err != nil {
+				return err
 			}
 		}
 
@@ -64,19 +72,11 @@ func (s *Session) CommitTransaction() error {
 			if oldValue, ok := s.db.store[key]; ok {
 				s.db.valueCounts[oldValue]--
 				delete(s.db.store, key)
-
-				op := struct {
-					Type string
-					Key  string
-				}{"DELETE", key}
-				data, err := json.Marshal(op)
-				if err != nil {
-					return fmt.Errorf("failed to marshal WAL entry: %w", err)
-				}
-				if _, err := s.db.walFile.Write(append(data, '\n')); err != nil {
-					return fmt.Errorf("failed to write to WAL file: %w", err)
+				if err := s.db.writeWAL(walEntry{Type: "DELETE", Key: key}); err != nil {
+					return err
 				}
 			}
+			delete(s.db.expiry, key)
 		}
 	}
 
@@ -91,9 +91,11 @@ func (s *Session) RollbackTransaction() error {
 }
 
 // Get returns the value of key, checking the transaction stack before the main store.
+// Keys that have expired are treated as absent.
 func (s *Session) Get(key string) (string, bool) {
 	s.db.mu.RLock()
 	defer s.db.mu.RUnlock()
+
 	tx := s.transactions.Peek()
 	for tx != nil {
 		if tx.deleted[key] {
@@ -105,13 +107,17 @@ func (s *Session) Get(key string) (string, bool) {
 		tx = tx.next
 	}
 
+	// Lazy expiry check on committed store
+	if exp, ok := s.db.expiry[key]; ok && time.Now().After(exp) {
+		return "", false
+	}
 	if val, ok := s.db.store[key]; ok {
 		return val, true
 	}
 	return "", false
 }
 
-// Set assigns value to key.
+// Set assigns value to key, clearing any existing TTL.
 func (s *Session) Set(key string, value string) error {
 	s.db.mu.Lock()
 	defer s.db.mu.Unlock()
@@ -120,6 +126,7 @@ func (s *Session) Set(key string, value string) error {
 	if active != nil {
 		delete(active.deleted, key)
 		active.store[key] = value
+		active.expiry[key] = time.Time{} // clear expiry on commit
 		return nil
 	}
 
@@ -128,20 +135,100 @@ func (s *Session) Set(key string, value string) error {
 	}
 	s.db.store[key] = value
 	s.db.valueCounts[value]++
+	delete(s.db.expiry, key)
 
-	op := struct {
-		Type  string
-		Key   string
-		Value string
-	}{"SET", key, value}
-	data, err := json.Marshal(op)
-	if err != nil {
-		return fmt.Errorf("failed to marshal WAL entry: %w", err)
+	return s.db.writeWAL(walEntry{Type: "SET", Key: key, Value: value})
+}
+
+// SetEX assigns value to key with a TTL. The key is deleted after ttl elapses.
+func (s *Session) SetEX(key, value string, ttl time.Duration) error {
+	if ttl <= 0 {
+		return fmt.Errorf("TTL must be positive")
 	}
-	if _, err := s.db.walFile.Write(append(data, '\n')); err != nil {
-		return fmt.Errorf("failed to write to WAL file: %w", err)
+	exp := time.Now().Add(ttl)
+
+	s.db.mu.Lock()
+	defer s.db.mu.Unlock()
+
+	active := s.transactions.Peek()
+	if active != nil {
+		delete(active.deleted, key)
+		active.store[key] = value
+		active.expiry[key] = exp
+		return nil
 	}
-	return nil
+
+	if oldValue, ok := s.db.store[key]; ok {
+		s.db.valueCounts[oldValue]--
+	}
+	s.db.store[key] = value
+	s.db.valueCounts[value]++
+	s.db.expiry[key] = exp
+
+	return s.db.writeWAL(walEntry{Type: "SET", Key: key, Value: value, ExpiresAt: exp.Unix()})
+}
+
+// TTL returns the remaining lifetime of key in seconds.
+// Returns -1 if the key exists but has no expiry.
+// Returns -2 if the key does not exist or has already expired.
+func (s *Session) TTL(key string) int64 {
+	s.db.mu.RLock()
+	defer s.db.mu.RUnlock()
+
+	// Check transaction stack first
+	tx := s.transactions.Peek()
+	for tx != nil {
+		if tx.deleted[key] {
+			return -2
+		}
+		if _, ok := tx.store[key]; ok {
+			if exp, hasExp := tx.expiry[key]; hasExp && !exp.IsZero() {
+				rem := time.Until(exp)
+				if rem <= 0 {
+					return -2
+				}
+				return int64(rem.Seconds())
+			}
+			// Key set in tx without TTL — check committed expiry
+			// (it will be cleared on commit, so report no expiry)
+			return -1
+		}
+		tx = tx.next
+	}
+
+	// Committed store
+	if exp, ok := s.db.expiry[key]; ok {
+		rem := time.Until(exp)
+		if rem <= 0 {
+			return -2 // expired but not yet evicted
+		}
+		return int64(rem.Seconds())
+	}
+	if _, ok := s.db.store[key]; ok {
+		return -1
+	}
+	return -2
+}
+
+// Persist removes the TTL from key, making it persist indefinitely.
+// Returns true if the key existed and had a TTL, false otherwise.
+func (s *Session) Persist(key string) bool {
+	s.db.mu.Lock()
+	defer s.db.mu.Unlock()
+
+	active := s.transactions.Peek()
+	if active != nil {
+		if _, ok := active.store[key]; ok {
+			active.expiry[key] = time.Time{} // zero = clear expiry on commit
+			return true
+		}
+	}
+
+	if _, ok := s.db.expiry[key]; ok {
+		delete(s.db.expiry, key)
+		return true
+	}
+	return false
 }
 
 // Delete removes key from the store.
@@ -152,6 +239,7 @@ func (s *Session) Delete(key string) error {
 	active := s.transactions.Peek()
 	if active != nil {
 		delete(active.store, key)
+		delete(active.expiry, key)
 		active.deleted[key] = true
 		return nil
 	}
@@ -160,25 +248,18 @@ func (s *Session) Delete(key string) error {
 		s.db.valueCounts[oldValue]--
 	}
 	delete(s.db.store, key)
+	delete(s.db.expiry, key)
 
-	op := struct {
-		Type string
-		Key  string
-	}{"DELETE", key}
-	data, err := json.Marshal(op)
-	if err != nil {
-		return fmt.Errorf("failed to marshal WAL entry: %w", err)
-	}
-	if _, err := s.db.walFile.Write(append(data, '\n')); err != nil {
-		return fmt.Errorf("failed to write to WAL file: %w", err)
-	}
-	return nil
+	return s.db.writeWAL(walEntry{Type: "DELETE", Key: key})
 }
 
-// Count returns the number of keys set to value, accounting for in-flight transactions.
+// Count returns the number of keys set to value, accounting for in-flight
+// transactions and skipping expired keys.
 func (s *Session) Count(value string) int {
 	s.db.mu.RLock()
 	defer s.db.mu.RUnlock()
+
+	now := time.Now()
 
 	// Collect all keys touched by any transaction
 	touchedKeys := make(map[string]bool)
@@ -192,13 +273,38 @@ func (s *Session) Count(value string) int {
 	}
 
 	if len(touchedKeys) == 0 {
-		return s.db.valueCounts[value]
+		// No active transaction — use valueCounts but subtract expired keys
+		count := s.db.valueCounts[value]
+		for key, exp := range s.db.expiry {
+			if now.After(exp) {
+				if s.db.store[key] == value {
+					count--
+				}
+			}
+		}
+		return count
 	}
 
 	count := s.db.valueCounts[value]
 
+	// Subtract expired keys from the base count
+	for key, exp := range s.db.expiry {
+		if now.After(exp) && !touchedKeys[key] {
+			if s.db.store[key] == value {
+				count--
+			}
+		}
+	}
+
 	for key := range touchedKeys {
 		committedVal, committedExists := s.db.store[key]
+		// A committed key that has expired counts as absent
+		if committedExists {
+			if exp, ok := s.db.expiry[key]; ok && now.After(exp) {
+				committedExists = false
+			}
+		}
+
 		txVal, txExists := s.effectiveTransactionValue(key)
 
 		if committedExists && committedVal == value {

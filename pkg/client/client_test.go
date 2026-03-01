@@ -3,6 +3,7 @@ package client_test
 import (
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/birand/brisedb/pkg/brisedb"
 	"github.com/birand/brisedb/pkg/client"
@@ -168,6 +169,78 @@ func TestClientCommitWithNoTransaction(t *testing.T) {
 
 	if err := c.Commit(); err == nil {
 		t.Error("expected error committing with no transaction")
+	}
+}
+
+func TestClientSetEX(t *testing.T) {
+	addr := startServer(t)
+	c := dial(t, addr)
+	defer c.Close()
+
+	if err := c.SetEX("temp", "val", 1*time.Second); err != nil {
+		t.Fatalf("SetEX: %v", err)
+	}
+
+	_, ok, _ := c.Get("temp")
+	if !ok {
+		t.Fatal("key should exist before expiry")
+	}
+
+	time.Sleep(1100 * time.Millisecond)
+
+	_, ok, _ = c.Get("temp")
+	if ok {
+		t.Error("key should be expired")
+	}
+}
+
+func TestClientTTL(t *testing.T) {
+	addr := startServer(t)
+	c := dial(t, addr)
+	defer c.Close()
+
+	// Missing key
+	n, err := c.TTL("ghost")
+	if err != nil {
+		t.Fatalf("TTL: %v", err)
+	}
+	if n != -2 {
+		t.Errorf("missing key TTL: want -2, got %d", n)
+	}
+
+	// Key with no expiry
+	c.Set("persist", "yes")
+	n, _ = c.TTL("persist")
+	if n != -1 {
+		t.Errorf("no-expiry TTL: want -1, got %d", n)
+	}
+
+	// Key with TTL
+	c.SetEX("temp", "x", 10*time.Second)
+	n, _ = c.TTL("temp")
+	if n <= 0 || n > 10 {
+		t.Errorf("TTL with expiry: want 1-10, got %d", n)
+	}
+}
+
+func TestClientPersist(t *testing.T) {
+	addr := startServer(t)
+	c := dial(t, addr)
+	defer c.Close()
+
+	c.SetEX("k", "v", 10*time.Second)
+
+	removed, err := c.Persist("k")
+	if err != nil {
+		t.Fatalf("Persist: %v", err)
+	}
+	if !removed {
+		t.Error("Persist: expected true (TTL was removed)")
+	}
+
+	n, _ := c.TTL("k")
+	if n != -1 {
+		t.Errorf("after Persist: want -1, got %d", n)
 	}
 }
 

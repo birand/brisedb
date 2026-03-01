@@ -4,8 +4,10 @@ import (
 	"bufio"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/birand/brisedb/pkg/brisedb"
 )
@@ -76,14 +78,28 @@ func (s *Server) handleConn(conn net.Conn) {
 
 		switch cmd {
 		case "SET":
+			// SET key value [EX seconds]
 			if len(args) < 2 {
 				respond("-ERROR: SET requires key and value")
 				continue
 			}
-			if err := session.Set(args[0], args[1]); err != nil {
-				respond("-" + err.Error())
+			if len(args) >= 4 && strings.ToUpper(args[2]) == "EX" {
+				secs, err := strconv.ParseInt(args[3], 10, 64)
+				if err != nil || secs <= 0 {
+					respond("-ERROR: EX requires a positive integer")
+					continue
+				}
+				if err := session.SetEX(args[0], args[1], time.Duration(secs)*time.Second); err != nil {
+					respond("-" + err.Error())
+				} else {
+					respond("+OK")
+				}
 			} else {
-				respond("+OK")
+				if err := session.Set(args[0], args[1]); err != nil {
+					respond("-" + err.Error())
+				} else {
+					respond("+OK")
+				}
 			}
 		case "GET":
 			if len(args) < 1 {
@@ -111,6 +127,22 @@ func (s *Server) handleConn(conn net.Conn) {
 				continue
 			}
 			respond(fmt.Sprintf("+%d", session.Count(args[0])))
+		case "TTL":
+			if len(args) < 1 {
+				respond("-ERROR: TTL requires key")
+				continue
+			}
+			respond(fmt.Sprintf("+%d", session.TTL(args[0])))
+		case "PERSIST":
+			if len(args) < 1 {
+				respond("-ERROR: PERSIST requires key")
+				continue
+			}
+			if session.Persist(args[0]) {
+				respond("+1")
+			} else {
+				respond("+0")
+			}
 		case "BEGIN":
 			session.BeginTransaction()
 			respond("+OK")
