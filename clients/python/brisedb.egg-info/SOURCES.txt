@@ -1,0 +1,9 @@
+pyproject.toml
+brisedb/__init__.py
+brisedb/client.py
+brisedb.egg-info/PKG-INFO
+brisedb.egg-info/SOURCES.txt
+brisedb.egg-info/dependency_links.txt
+brisedb.egg-info/requires.txt
+brisedb.egg-info/top_level.txt
+tests/test_client.py
