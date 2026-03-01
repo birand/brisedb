@@ -3,6 +3,7 @@ package server
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"net"
 	"strconv"
 	"strings"
@@ -17,6 +18,7 @@ type Server struct {
 	db       *brisedb.BriseDB
 	listener net.Listener
 	wg       sync.WaitGroup
+	ReadOnly bool // when true, write commands are rejected (replica mode)
 }
 
 // New creates a Server bound to addr.
@@ -107,7 +109,22 @@ func (s *Server) handleConn(conn net.Conn) {
 		cmd := strings.ToUpper(parts[0])
 		args := parts[1:]
 
+		// Replica mode: only allow reads, REPLICATE is only for primary→replica handshake.
+		if s.ReadOnly {
+			switch cmd {
+			case "GET", "COUNT", "TTL", "KEYS", "SCAN", "STOP":
+				// allowed
+			default:
+				respond("-ERROR: server is read-only")
+				continue
+			}
+		}
+
 		switch cmd {
+		case "REPLICATE":
+			// Hand off to dedicated handler; does not return until conn closes.
+			s.handleReplicate(conn, w, &wmu)
+			return
 		case "SET":
 			// SET key value [EX seconds]
 			if len(args) < 2 {
@@ -269,6 +286,61 @@ func (s *Server) handleConn(conn net.Conn) {
 			return
 		default:
 			respond("-ERROR: unknown command " + cmd)
+		}
+	}
+}
+
+// handleReplicate streams WAL entries to a replica that sent REPLICATE.
+// It first sends a snapshot of the current store, then streams live entries
+// until the connection is closed.
+func (s *Server) handleReplicate(conn net.Conn, w *bufio.Writer, wmu *sync.Mutex) {
+	rm := s.db.Replication()
+
+	// Register the replica channel before taking the snapshot so we don't miss
+	// any entries written between snapshot and registration.
+	ch := make(chan []byte, 4096)
+	rm.Register(ch)
+	defer rm.Unregister(ch)
+
+	respond := func(msg string) {
+		wmu.Lock()
+		fmt.Fprintf(w, "%s\n", msg)
+		w.Flush()
+		wmu.Unlock()
+	}
+
+	// Send snapshot
+	for _, entry := range s.db.Snapshot() {
+		respond("+" + string(entry))
+	}
+	// Signal end of snapshot
+	respond("+READY")
+
+	// Drain any entries that arrived during snapshot, then stream live ones.
+	// A separate goroutine detects when the replica closes the connection.
+	connClosed := make(chan struct{})
+	go func() {
+		io.Copy(io.Discard, conn)
+		close(connClosed)
+	}()
+
+	for {
+		select {
+		case entry, ok := <-ch:
+			if !ok {
+				return
+			}
+			wmu.Lock()
+			_, err := fmt.Fprintf(w, "+%s\n", entry)
+			if err == nil {
+				err = w.Flush()
+			}
+			wmu.Unlock()
+			if err != nil {
+				return
+			}
+		case <-connClosed:
+			return
 		}
 	}
 }

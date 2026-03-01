@@ -28,6 +28,7 @@ type BriseDB struct {
 	valueCounts map[string]int
 	expiry      map[string]time.Time // keys with a TTL
 	pubsub      *PubSub
+	replication *replicationManager
 	walFile     *os.File
 	walPath     string
 	stopCh      chan struct{}
@@ -45,6 +46,7 @@ func NewBriseDB(walPath string) (*BriseDB, error) {
 		valueCounts: make(map[string]int),
 		expiry:      make(map[string]time.Time),
 		pubsub:      newPubSub(),
+		replication: newReplicationManager(),
 		walFile:     walFile,
 		walPath:     walPath,
 		stopCh:      make(chan struct{}),
@@ -121,27 +123,11 @@ func (db *BriseDB) replayWAL() error {
 			return fmt.Errorf("failed to unmarshal WAL entry: %w", err)
 		}
 
-		switch op.Type {
-		case "SET":
-			// Skip keys that have already expired
-			if op.ExpiresAt > 0 && time.Unix(op.ExpiresAt, 0).Before(now) {
-				continue
-			}
-			if oldValue, ok := db.store[op.Key]; ok {
-				db.valueCounts[oldValue]--
-			}
-			db.store[op.Key] = op.Value
-			db.valueCounts[op.Value]++
-			if op.ExpiresAt > 0 {
-				db.expiry[op.Key] = time.Unix(op.ExpiresAt, 0)
-			}
-		case "DELETE":
-			if oldValue, ok := db.store[op.Key]; ok {
-				db.valueCounts[oldValue]--
-			}
-			delete(db.store, op.Key)
-			delete(db.expiry, op.Key)
+		// Skip SET entries that have already expired
+		if op.Type == "SET" && op.ExpiresAt > 0 && time.Unix(op.ExpiresAt, 0).Before(now) {
+			continue
 		}
+		db.applyEntry(op)
 	}
 
 	return scanner.Err()
@@ -196,17 +182,82 @@ func (db *BriseDB) Compact() error {
 	return nil
 }
 
-// writeWAL appends a walEntry to the WAL file. Must be called with mu held.
+// writeWAL appends a walEntry to the WAL file and fans it out to replicas.
+// Must be called with mu held.
 func (db *BriseDB) writeWAL(op walEntry) error {
 	data, err := json.Marshal(op)
 	if err != nil {
 		return fmt.Errorf("failed to marshal WAL entry: %w", err)
 	}
-	if _, err := db.walFile.Write(append(data, '\n')); err != nil {
+	line := append(data, '\n')
+	if _, err := db.walFile.Write(line); err != nil {
 		return fmt.Errorf("failed to write to WAL file: %w", err)
 	}
+	db.replication.fanout(data) // non-blocking; slow replicas drop entries
 	return nil
 }
+
+// applyEntry applies a single WAL entry to the in-memory store.
+// Must be called with mu held.
+func (db *BriseDB) applyEntry(op walEntry) {
+	switch op.Type {
+	case "SET":
+		if oldValue, ok := db.store[op.Key]; ok {
+			db.valueCounts[oldValue]--
+		}
+		db.store[op.Key] = op.Value
+		db.valueCounts[op.Value]++
+		if op.ExpiresAt > 0 {
+			db.expiry[op.Key] = time.Unix(op.ExpiresAt, 0)
+		} else {
+			delete(db.expiry, op.Key)
+		}
+	case "DELETE":
+		if oldValue, ok := db.store[op.Key]; ok {
+			db.valueCounts[oldValue]--
+		}
+		delete(db.store, op.Key)
+		delete(db.expiry, op.Key)
+	}
+}
+
+// Snapshot returns all current WAL entries as JSON lines (without newlines).
+// It is called by the replication handler to send an initial state to a new replica.
+func (db *BriseDB) Snapshot() [][]byte {
+	now := time.Now()
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	entries := make([][]byte, 0, len(db.store))
+	for key, value := range db.store {
+		if exp, ok := db.expiry[key]; ok && now.After(exp) {
+			continue
+		}
+		op := walEntry{Type: "SET", Key: key, Value: value}
+		if exp, ok := db.expiry[key]; ok {
+			op.ExpiresAt = exp.Unix()
+		}
+		data, _ := json.Marshal(op)
+		entries = append(entries, data)
+	}
+	return entries
+}
+
+// ApplyReplicationEntry decodes a WAL JSON line and applies it to the store.
+// Used by replica instances to consume entries streamed from the primary.
+func (db *BriseDB) ApplyReplicationEntry(data []byte) error {
+	var op walEntry
+	if err := json.Unmarshal(data, &op); err != nil {
+		return fmt.Errorf("replication: bad entry: %w", err)
+	}
+	db.mu.Lock()
+	db.applyEntry(op)
+	db.mu.Unlock()
+	return nil
+}
+
+// Replication returns the replication manager (used by the server handler).
+func (db *BriseDB) Replication() *replicationManager { return db.replication }
 
 // Transaction points to a key:value storage
 type Transaction struct {
