@@ -126,6 +126,12 @@ func (s *Server) handleConn(conn net.Conn) {
 			} else {
 				respond("+OK")
 			}
+		case "COMPACT":
+			if err := s.db.Compact(); err != nil {
+				respond("-" + err.Error())
+			} else {
+				respond("+OK")
+			}
 		case "STOP":
 			respond("+OK")
 			return

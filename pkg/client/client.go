@@ -85,6 +85,12 @@ func (c *Client) Rollback() error {
 	return err
 }
 
+// Compact rewrites the server's WAL with only the current committed state.
+func (c *Client) Compact() error {
+	_, err := c.do("COMPACT")
+	return err
+}
+
 // do sends a command and returns the payload of the response (stripping the +/- prefix).
 // Errors from the server (- prefix) are returned as Go errors.
 func (c *Client) do(parts ...string) (string, error) {

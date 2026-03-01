@@ -171,6 +171,30 @@ func TestClientCommitWithNoTransaction(t *testing.T) {
 	}
 }
 
+func TestClientCompact(t *testing.T) {
+	addr := startServer(t)
+	c := dial(t, addr)
+	defer c.Close()
+
+	c.Set("a", "1")
+	c.Set("b", "2")
+	c.Delete("a")
+
+	if err := c.Compact(); err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+
+	// Data still readable after compaction
+	_, ok, _ := c.Get("a")
+	if ok {
+		t.Error("deleted key 'a' still present after Compact")
+	}
+	val, ok, _ := c.Get("b")
+	if !ok || val != "2" {
+		t.Errorf("key 'b' after Compact: want (2, true), got (%q, %v)", val, ok)
+	}
+}
+
 func TestClientConcurrent(t *testing.T) {
 	addr := startServer(t)
 

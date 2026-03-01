@@ -28,7 +28,7 @@ func main() {
 		input, _ := reader.ReadString('\n')
 		command, args := parseCommand(input)
 
-		if err := executeCommand(session, command, args); err != nil {
+		if err := executeCommand(db, session, command, args); err != nil {
 			logger.Error("command failed", "error", err)
 		}
 	}
@@ -43,7 +43,7 @@ func parseCommand(input string) (string, []string) {
 	return parts[0], parts[1:]
 }
 
-func executeCommand(session *brisedb.Session, command string, args []string) error {
+func executeCommand(db *brisedb.BriseDB, session *brisedb.Session, command string, args []string) error {
 	switch command {
 	case "BEGIN":
 		session.BeginTransaction()
@@ -76,8 +76,7 @@ func executeCommand(session *brisedb.Session, command string, args []string) err
 		}
 		fmt.Println(session.Count(args[0]))
 	case "COMPACT":
-		// Compact is a DB-level operation; not exposed on Session
-		return fmt.Errorf("COMPACT not available in CLI session mode")
+		return db.Compact()
 	case "STOP":
 		os.Exit(0)
 	case "":
