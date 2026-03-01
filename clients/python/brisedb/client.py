@@ -310,6 +310,176 @@ class PubSubConn:
         return None
 
 
+class WALEntry:
+    """A single WAL entry received from a primary server.
+
+    op      — ``"SET"`` or ``"DELETE"``
+    key     — the key
+    value   — the value (only set for ``op == "SET"``)
+    expires_at — Unix timestamp of expiry, or 0 for no expiry
+    """
+
+    __slots__ = ("op", "key", "value", "expires_at")
+
+    def __init__(self, op: str, key: str, value: str = "", expires_at: int = 0):
+        self.op = op
+        self.key = key
+        self.value = value
+        self.expires_at = expires_at
+
+    def __repr__(self) -> str:
+        return (
+            f"WALEntry(op={self.op!r}, key={self.key!r}, "
+            f"value={self.value!r}, expires_at={self.expires_at})"
+        )
+
+
+class ReplicaConn:
+    """Connects to a primary brisedb server and streams WAL entries.
+
+    On connect the primary sends a snapshot of its current state followed by
+    ``+READY``.  After that, every committed write is streamed in real time.
+
+    Usage — iterator (blocks until connection closed)::
+
+        with brisedb.ReplicaConn("localhost", 6380) as rep:
+            for entry in rep:           # WALEntry objects
+                if entry.op == "SET":
+                    cache[entry.key] = entry.value
+                else:
+                    cache.pop(entry.key, None)
+
+    Usage — callback (non-blocking, background thread)::
+
+        def on_entry(entry):
+            print(entry)
+
+        rep = brisedb.ReplicaConn("localhost", 6380, on_entry=on_entry)
+        # ... do other work ...
+        rep.close()
+
+    Usage — low-level, read one entry at a time::
+
+        with brisedb.ReplicaConn("localhost", 6380) as rep:
+            entry = rep.poll(timeout=2.0)   # returns None on timeout
+    """
+
+    def __init__(
+        self,
+        host: str = "localhost",
+        port: int = 6380,
+        *,
+        on_entry=None,
+    ):
+        import json as _json
+
+        self._json = _json
+        self._sock = socket.create_connection((host, port))
+        self._file = self._sock.makefile("r", encoding="utf-8")
+        self._queue: queue.Queue[WALEntry | None] = queue.Queue(maxsize=4096)
+        self._ready = threading.Event()
+
+        self._sock.sendall(b"REPLICATE\n")
+
+        self._thread = threading.Thread(target=self._read_loop, daemon=True)
+        self._thread.start()
+
+        # Block until the snapshot has been fully applied
+        self._ready.wait()
+
+        if on_entry is not None:
+            threading.Thread(
+                target=self._dispatch_loop,
+                args=(on_entry,),
+                daemon=True,
+            ).start()
+
+    # ------------------------------------------------------------------ #
+    # Context manager
+    # ------------------------------------------------------------------ #
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+    # ------------------------------------------------------------------ #
+    # Public API
+    # ------------------------------------------------------------------ #
+
+    def __iter__(self):
+        """Yield WALEntry objects until the connection is closed."""
+        while True:
+            entry = self._queue.get()
+            if entry is None:
+                break
+            yield entry
+
+    def poll(self, timeout: float | None = None) -> "WALEntry | None":
+        """Return the next entry, or ``None`` if *timeout* seconds elapse."""
+        try:
+            return self._queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def close(self) -> None:
+        """Close the connection to the primary."""
+        try:
+            self._sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+
+    # ------------------------------------------------------------------ #
+    # Internal
+    # ------------------------------------------------------------------ #
+
+    def _read_loop(self) -> None:
+        try:
+            for line in self._file:
+                line = line.rstrip("\n")
+                if not line.startswith("+"):
+                    continue
+                payload = line[1:]
+                if payload == "READY":
+                    self._ready.set()
+                    continue
+                entry = self._parse(payload)
+                if entry:
+                    self._queue.put(entry)
+        except OSError:
+            pass
+        finally:
+            self._ready.set()  # unblock __init__ if we never saw +READY
+            self._queue.put(None)
+
+    def _dispatch_loop(self, on_entry) -> None:
+        for entry in self:
+            try:
+                on_entry(entry)
+            except Exception:
+                pass
+
+    def _parse(self, payload: str) -> "WALEntry | None":
+        try:
+            obj = self._json.loads(payload)
+        except ValueError:
+            return None
+        op = obj.get("Type", "")
+        if op not in ("SET", "DELETE"):
+            return None
+        return WALEntry(
+            op=op,
+            key=obj.get("Key", ""),
+            value=obj.get("Value", ""),
+            expires_at=obj.get("ExpiresAt", 0),
+        )
+
+
 class _Transaction:
     """Internal context manager returned by Client.transaction()."""
 
