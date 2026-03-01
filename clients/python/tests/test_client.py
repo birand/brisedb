@@ -184,6 +184,48 @@ def collect_msg(ps, kind, timeout=2.0):
     raise TimeoutError(f"timed out waiting for {kind!r} message")
 
 
+def test_keys_star(client):
+    client.set("foo", "1")
+    client.set("bar", "2")
+    client.set("baz", "3")
+    assert sorted(client.keys("*")) == ["bar", "baz", "foo"]
+
+
+def test_keys_prefix(client):
+    client.set("foo", "1")
+    client.set("bar", "2")
+    client.set("baz", "3")
+    assert sorted(client.keys("ba*")) == ["bar", "baz"]
+
+
+def test_keys_no_match(client):
+    client.set("foo", "1")
+    assert client.keys("xyz*") == []
+
+
+def test_scan_full(client):
+    for i in range(10):
+        client.set(f"key{i:02d}", "v")
+
+    collected = set()
+    cursor = 0
+    while True:
+        cursor, batch = client.scan(cursor, count=3)
+        collected.update(batch)
+        if cursor == 0:
+            break
+
+    assert len(collected) == 10
+
+
+def test_scan_all_at_once(client):
+    for i in range(5):
+        client.set(f"item{i}", "v")
+    cursor, keys = client.scan(0, count=100)
+    assert cursor == 0
+    assert len(keys) == 5
+
+
 def test_publish_no_subscribers(client):
     assert client.publish("news", "hello") == 0
 

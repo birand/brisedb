@@ -90,6 +90,32 @@ class Client:
         """Remove the TTL from *key*.  Returns ``True`` if a TTL was removed."""
         return self._cmd("PERSIST", key) == "1"
 
+    def keys(self, pattern: str = "*") -> list[str]:
+        """Return all keys matching *pattern*. Supports * and ? wildcards."""
+        return self._cmd_list("KEYS", pattern)
+
+    def scan(self, cursor: int = 0, count: int = 10) -> tuple[int, list[str]]:
+        """Return a paginated batch of keys.
+
+        Returns ``(next_cursor, keys)``. When *next_cursor* is 0, iteration
+        is complete.
+        """
+        line = f"SCAN {cursor} COUNT {count}\n"
+        with self._lock:
+            self._sock.sendall(line.encode("utf-8"))
+            # First line: "+<next_cursor> <N>"
+            resp = self._file.readline().rstrip("\n")
+        if resp.startswith("-"):
+            raise BriseDBError(resp[1:])
+        if not resp.startswith("+"):
+            raise BriseDBError(f"malformed SCAN response: {resp!r}")
+        parts = resp[1:].split()
+        if len(parts) < 2:
+            raise BriseDBError(f"malformed SCAN response: {resp!r}")
+        next_cursor, n = int(parts[0]), int(parts[1])
+        batch = self._read_lines(n)
+        return next_cursor, batch
+
     def publish(self, channel: str, message: str) -> int:
         """Publish *message* to *channel*. Returns the number of receivers."""
         return int(self._cmd("PUBLISH", channel, message))
@@ -128,6 +154,29 @@ class Client:
     # ------------------------------------------------------------------ #
     # Internal
     # ------------------------------------------------------------------ #
+
+    def _cmd_list(self, *parts: str) -> list[str]:
+        """Send a command and read a count-prefixed list of values."""
+        line = " ".join(parts) + "\n"
+        with self._lock:
+            self._sock.sendall(line.encode("utf-8"))
+            resp = self._file.readline().rstrip("\n")
+            if resp.startswith("-"):
+                raise BriseDBError(resp[1:])
+            if not resp.startswith("+"):
+                raise BriseDBError(f"malformed response: {resp!r}")
+            n = int(resp[1:])
+            return self._read_lines(n)
+
+    def _read_lines(self, n: int) -> list[str]:
+        """Read n '+value' lines. Must be called while self._lock is held."""
+        result = []
+        for _ in range(n):
+            line = self._file.readline().rstrip("\n")
+            if not line.startswith("+"):
+                raise BriseDBError(f"malformed list item: {line!r}")
+            result.append(line[1:])
+        return result
 
     def _cmd(self, *parts: str) -> str:
         line = " ".join(parts) + "\n"

@@ -172,6 +172,70 @@ func TestClientCommitWithNoTransaction(t *testing.T) {
 	}
 }
 
+func TestClientKeys(t *testing.T) {
+	addr := startServer(t)
+	c := dial(t, addr)
+	defer c.Close()
+
+	c.Set("foo", "1")
+	c.Set("bar", "2")
+	c.Set("baz", "3")
+
+	keys, err := c.Keys("*")
+	if err != nil {
+		t.Fatalf("Keys: %v", err)
+	}
+	if len(keys) != 3 {
+		t.Errorf("want 3 keys, got %d: %v", len(keys), keys)
+	}
+
+	keys, err = c.Keys("ba*")
+	if err != nil {
+		t.Fatalf("Keys ba*: %v", err)
+	}
+	if len(keys) != 2 {
+		t.Errorf("ba*: want 2, got %d: %v", len(keys), keys)
+	}
+
+	keys, err = c.Keys("xyz*")
+	if err != nil {
+		t.Fatalf("Keys xyz*: %v", err)
+	}
+	if len(keys) != 0 {
+		t.Errorf("xyz*: want 0, got %d", len(keys))
+	}
+}
+
+func TestClientScan(t *testing.T) {
+	addr := startServer(t)
+	c := dial(t, addr)
+	defer c.Close()
+
+	for i := 0; i < 10; i++ {
+		c.Set(fmt.Sprintf("key%02d", i), "v")
+	}
+
+	// Full scan with small batches
+	collected := map[string]bool{}
+	cursor := 0
+	for {
+		next, keys, err := c.Scan(cursor, 3)
+		if err != nil {
+			t.Fatalf("Scan: %v", err)
+		}
+		for _, k := range keys {
+			collected[k] = true
+		}
+		if next == 0 {
+			break
+		}
+		cursor = next
+	}
+	if len(collected) != 10 {
+		t.Errorf("scan collected %d keys, want 10", len(collected))
+	}
+}
+
 func TestClientSetEX(t *testing.T) {
 	addr := startServer(t)
 	c := dial(t, addr)

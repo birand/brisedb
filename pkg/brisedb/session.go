@@ -2,6 +2,7 @@ package brisedb
 
 import (
 	"fmt"
+	"sort"
 	"time"
 )
 
@@ -330,4 +331,98 @@ func (s *Session) effectiveTransactionValue(key string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// Keys returns all committed keys whose names match pattern.
+// Pattern supports glob wildcards: * (any sequence), ? (any single char).
+// Expired keys are excluded. Results are sorted alphabetically.
+func (s *Session) Keys(pattern string) ([]string, error) {
+	s.db.mu.RLock()
+	defer s.db.mu.RUnlock()
+
+	now := time.Now()
+	var result []string
+	for key := range s.db.store {
+		if exp, ok := s.db.expiry[key]; ok && now.After(exp) {
+			continue
+		}
+		matched, err := globMatch(pattern, key)
+		if err != nil {
+			return nil, fmt.Errorf("invalid pattern %q: %w", pattern, err)
+		}
+		if matched {
+			result = append(result, key)
+		}
+	}
+	sort.Strings(result)
+	return result, nil
+}
+
+// Scan returns a paginated batch of committed keys starting at cursor.
+// count is a hint for the batch size; the actual count may be smaller.
+// When the returned nextCursor is 0, iteration is complete.
+// Keys are iterated in alphabetical order. Expired keys are excluded.
+func (s *Session) Scan(cursor, count int) (nextCursor int, keys []string) {
+	if count <= 0 {
+		count = 10
+	}
+	s.db.mu.RLock()
+	defer s.db.mu.RUnlock()
+
+	now := time.Now()
+	all := make([]string, 0, len(s.db.store))
+	for key := range s.db.store {
+		if exp, ok := s.db.expiry[key]; ok && now.After(exp) {
+			continue
+		}
+		all = append(all, key)
+	}
+	sort.Strings(all)
+
+	if cursor >= len(all) {
+		return 0, nil
+	}
+	end := cursor + count
+	if end >= len(all) {
+		return 0, all[cursor:]
+	}
+	return end, all[cursor:end]
+}
+
+// globMatch reports whether key matches the glob pattern.
+// * matches any sequence of characters (including /), ? matches any single character.
+func globMatch(pattern, key string) (bool, error) {
+	return matchGlob(pattern, key), nil
+}
+
+func matchGlob(p, s string) bool {
+	for len(p) > 0 {
+		switch p[0] {
+		case '*':
+			// skip consecutive stars
+			for len(p) > 0 && p[0] == '*' {
+				p = p[1:]
+			}
+			if len(p) == 0 {
+				return true
+			}
+			for i := 0; i <= len(s); i++ {
+				if matchGlob(p, s[i:]) {
+					return true
+				}
+			}
+			return false
+		case '?':
+			if len(s) == 0 {
+				return false
+			}
+			p, s = p[1:], s[1:]
+		default:
+			if len(s) == 0 || p[0] != s[0] {
+				return false
+			}
+			p, s = p[1:], s[1:]
+		}
+	}
+	return len(s) == 0
 }

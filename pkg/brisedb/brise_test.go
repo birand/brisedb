@@ -1,6 +1,7 @@
 package brisedb
 
 import (
+	"fmt"
 	"testing"
 	"time"
 )
@@ -179,6 +180,124 @@ func TestCountInTransaction(t *testing.T) {
 	}
 
 	session.RollbackTransaction()
+}
+
+func TestKeys(t *testing.T) {
+	_, session, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	session.Set("foo", "1")
+	session.Set("bar", "2")
+	session.Set("baz", "3")
+	session.Set("qux", "4")
+
+	t.Run("star matches all", func(t *testing.T) {
+		keys, err := session.Keys("*")
+		if err != nil {
+			t.Fatalf("Keys: %v", err)
+		}
+		if len(keys) != 4 {
+			t.Errorf("want 4 keys, got %d: %v", len(keys), keys)
+		}
+	})
+
+	t.Run("prefix match", func(t *testing.T) {
+		keys, _ := session.Keys("ba*")
+		if len(keys) != 2 {
+			t.Errorf("ba*: want 2, got %d: %v", len(keys), keys)
+		}
+	})
+
+	t.Run("exact match", func(t *testing.T) {
+		keys, _ := session.Keys("foo")
+		if len(keys) != 1 || keys[0] != "foo" {
+			t.Errorf("exact: want [foo], got %v", keys)
+		}
+	})
+
+	t.Run("question mark", func(t *testing.T) {
+		keys, _ := session.Keys("ba?")
+		if len(keys) != 2 {
+			t.Errorf("ba?: want 2, got %d: %v", len(keys), keys)
+		}
+	})
+
+	t.Run("no match", func(t *testing.T) {
+		keys, _ := session.Keys("xyz*")
+		if len(keys) != 0 {
+			t.Errorf("no match: want 0, got %d", len(keys))
+		}
+	})
+
+	t.Run("sorted result", func(t *testing.T) {
+		keys, _ := session.Keys("*")
+		for i := 1; i < len(keys); i++ {
+			if keys[i] < keys[i-1] {
+				t.Errorf("not sorted: %v", keys)
+			}
+		}
+	})
+}
+
+func TestKeys_ExcludesExpired(t *testing.T) {
+	_, session, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	session.Set("live", "1")
+	session.SetEX("dead", "2", 50*time.Millisecond)
+
+	time.Sleep(60 * time.Millisecond)
+
+	keys, _ := session.Keys("*")
+	for _, k := range keys {
+		if k == "dead" {
+			t.Error("Keys should exclude expired keys")
+		}
+	}
+}
+
+func TestScan(t *testing.T) {
+	_, session, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	for i := 0; i < 10; i++ {
+		session.Set(fmt.Sprintf("key%02d", i), "v")
+	}
+
+	t.Run("full scan", func(t *testing.T) {
+		collected := map[string]bool{}
+		cursor := 0
+		for {
+			next, keys := session.Scan(cursor, 3)
+			for _, k := range keys {
+				collected[k] = true
+			}
+			if next == 0 {
+				break
+			}
+			cursor = next
+		}
+		if len(collected) != 10 {
+			t.Errorf("scan collected %d keys, want 10", len(collected))
+		}
+	})
+
+	t.Run("count larger than total", func(t *testing.T) {
+		next, keys := session.Scan(0, 100)
+		if next != 0 {
+			t.Errorf("want cursor 0 (done), got %d", next)
+		}
+		if len(keys) != 10 {
+			t.Errorf("want 10 keys, got %d", len(keys))
+		}
+	})
+
+	t.Run("cursor past end", func(t *testing.T) {
+		next, keys := session.Scan(999, 10)
+		if next != 0 || len(keys) != 0 {
+			t.Errorf("past end: want (0, []), got (%d, %v)", next, keys)
+		}
+	})
 }
 
 func TestTTL_BasicExpiry(t *testing.T) {

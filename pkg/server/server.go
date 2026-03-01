@@ -174,6 +174,42 @@ func (s *Server) handleConn(conn net.Conn) {
 			} else {
 				respond("+0")
 			}
+		case "KEYS":
+			if len(args) < 1 {
+				respond("-ERROR: KEYS requires a pattern")
+				continue
+			}
+			keys, err := session.Keys(args[0])
+			if err != nil {
+				respond("-" + err.Error())
+				continue
+			}
+			respond(fmt.Sprintf("+%d", len(keys)))
+			for _, k := range keys {
+				respond("+" + k)
+			}
+		case "SCAN":
+			// SCAN <cursor> COUNT <count>
+			if len(args) < 1 {
+				respond("-ERROR: SCAN requires a cursor")
+				continue
+			}
+			cursor, err := strconv.Atoi(args[0])
+			if err != nil || cursor < 0 {
+				respond("-ERROR: cursor must be a non-negative integer")
+				continue
+			}
+			count := 10
+			if len(args) >= 3 && strings.ToUpper(args[1]) == "COUNT" {
+				if n, err := strconv.Atoi(args[2]); err == nil && n > 0 {
+					count = n
+				}
+			}
+			next, keys := session.Scan(cursor, count)
+			respond(fmt.Sprintf("+%d %d", next, len(keys)))
+			for _, k := range keys {
+				respond("+" + k)
+			}
 		case "SUBSCRIBE":
 			if len(args) < 1 {
 				respond("-ERROR: SUBSCRIBE requires at least one channel")

@@ -121,6 +121,40 @@ func (c *Client) Persist(key string) (bool, error) {
 	return raw == "1", nil
 }
 
+// Keys returns all keys matching pattern. Supports * and ? wildcards.
+func (c *Client) Keys(pattern string) ([]string, error) {
+	return c.doList("KEYS", pattern)
+}
+
+// Scan returns a paginated batch of keys starting at cursor.
+// count is a hint for the batch size.
+// When the returned nextCursor is 0, iteration is complete.
+func (c *Client) Scan(cursor, count int) (nextCursor int, keys []string, err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	line := fmt.Sprintf("SCAN %d COUNT %d\n", cursor, count)
+	if _, err := fmt.Fprint(c.conn, line); err != nil {
+		return 0, nil, fmt.Errorf("brisedb: write: %w", err)
+	}
+
+	// First line: "+<next_cursor> <N>"
+	resp, err := c.r.ReadString('\n')
+	if err != nil {
+		return 0, nil, fmt.Errorf("brisedb: read: %w", err)
+	}
+	resp = strings.TrimRight(resp, "\n")
+	if strings.HasPrefix(resp, "-") {
+		return 0, nil, fmt.Errorf("brisedb: %s", resp[1:])
+	}
+	var n int
+	if _, err := fmt.Sscanf(resp[1:], "%d %d", &nextCursor, &n); err != nil {
+		return 0, nil, fmt.Errorf("brisedb: malformed SCAN response %q", resp)
+	}
+	keys, err = c.readLines(n)
+	return nextCursor, keys, err
+}
+
 // Publish sends payload to all subscribers of channel.
 // Returns the number of subscribers that received the message.
 func (c *Client) Publish(channel, payload string) (int, error) {
@@ -165,4 +199,47 @@ func (c *Client) do(parts ...string) (string, error) {
 		return "", fmt.Errorf("brisedb: %s", resp[1:])
 	}
 	return "", fmt.Errorf("brisedb: malformed response %q", resp)
+}
+
+// doList sends a command and reads a count-prefixed list of values.
+// Server response: "+<N>\n+item1\n+item2\n..."
+func (c *Client) doList(parts ...string) ([]string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	line := strings.Join(parts, " ") + "\n"
+	if _, err := fmt.Fprint(c.conn, line); err != nil {
+		return nil, fmt.Errorf("brisedb: write: %w", err)
+	}
+
+	resp, err := c.r.ReadString('\n')
+	if err != nil {
+		return nil, fmt.Errorf("brisedb: read: %w", err)
+	}
+	resp = strings.TrimRight(resp, "\n")
+	if strings.HasPrefix(resp, "-") {
+		return nil, fmt.Errorf("brisedb: %s", resp[1:])
+	}
+	var n int
+	if _, err := fmt.Sscan(resp[1:], &n); err != nil {
+		return nil, fmt.Errorf("brisedb: malformed count %q", resp)
+	}
+	return c.readLines(n)
+}
+
+// readLines reads n "+value" lines. Must be called with c.mu held.
+func (c *Client) readLines(n int) ([]string, error) {
+	result := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		line, err := c.r.ReadString('\n')
+		if err != nil {
+			return result, fmt.Errorf("brisedb: read: %w", err)
+		}
+		line = strings.TrimRight(line, "\n")
+		if !strings.HasPrefix(line, "+") {
+			return result, fmt.Errorf("brisedb: malformed list item %q", line)
+		}
+		result = append(result, line[1:])
+	}
+	return result, nil
 }
