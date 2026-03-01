@@ -18,7 +18,9 @@ func main() {
 		logger.Error("failed to create database", "error", err)
 		os.Exit(1)
 	}
+	defer db.Close()
 
+	session := db.NewSession()
 	reader := bufio.NewReader(os.Stdin)
 
 	for {
@@ -26,7 +28,7 @@ func main() {
 		input, _ := reader.ReadString('\n')
 		command, args := parseCommand(input)
 
-		if err := executeCommand(db, command, args); err != nil {
+		if err := executeCommand(session, command, args); err != nil {
 			logger.Error("command failed", "error", err)
 		}
 	}
@@ -41,24 +43,24 @@ func parseCommand(input string) (string, []string) {
 	return parts[0], parts[1:]
 }
 
-func executeCommand(db *brisedb.BriseDB, command string, args []string) error {
+func executeCommand(session *brisedb.Session, command string, args []string) error {
 	switch command {
 	case "BEGIN":
-		db.BeginTransaction()
+		session.BeginTransaction()
 	case "ROLLBACK":
-		return db.RollbackTransaction()
+		return session.RollbackTransaction()
 	case "COMMIT":
-		return db.CommitTransaction()
+		return session.CommitTransaction()
 	case "SET":
 		if len(args) < 2 {
 			return fmt.Errorf("ERROR: Missing key or value argument for SET")
 		}
-		return db.Set(args[0], args[1])
+		return session.Set(args[0], args[1])
 	case "GET":
 		if len(args) < 1 {
 			return fmt.Errorf("ERROR: Missing key argument for GET")
 		}
-		if val, ok := db.Get(args[0]); ok {
+		if val, ok := session.Get(args[0]); ok {
 			fmt.Println(val)
 		} else {
 			fmt.Printf("%s not set\n", args[0])
@@ -67,14 +69,15 @@ func executeCommand(db *brisedb.BriseDB, command string, args []string) error {
 		if len(args) < 1 {
 			return fmt.Errorf("ERROR: Missing key argument for DELETE")
 		}
-		return db.Delete(args[0])
+		return session.Delete(args[0])
 	case "COUNT":
 		if len(args) < 1 {
 			return fmt.Errorf("ERROR: Missing value argument for COUNT")
 		}
-		fmt.Println(db.Count(args[0]))
+		fmt.Println(session.Count(args[0]))
 	case "COMPACT":
-		return db.Compact()
+		// Compact is a DB-level operation; not exposed on Session
+		return fmt.Errorf("COMPACT not available in CLI session mode")
 	case "STOP":
 		os.Exit(0)
 	case "":
