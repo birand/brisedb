@@ -1,19 +1,13 @@
 package brisedb
 
 import (
-	"os"
 	"testing"
 )
 
 func setupTestDB(t *testing.T) (*BriseDB, func()) {
-	// Truncate the WAL file
-	walFile, err := os.OpenFile("wal.log", os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		t.Fatalf("Failed to truncate WAL file: %v", err)
-	}
-	walFile.Close()
+	walPath := t.TempDir() + "/wal.log"
 
-	db, err := NewBriseDB()
+	db, err := NewBriseDB(walPath)
 	if err != nil {
 		t.Fatalf("Failed to create BriseDB: %v", err)
 	}
@@ -124,13 +118,16 @@ func TestTransaction(t *testing.T) {
 }
 
 func TestPersistence(t *testing.T) {
-	db, cleanup := setupTestDB(t)
+	walPath := t.TempDir() + "/wal.log"
 
+	db, err := NewBriseDB(walPath)
+	if err != nil {
+		t.Fatalf("Failed to create BriseDB: %v", err)
+	}
 	db.Set("persisted", "true")
+	db.walFile.Close()
 
-	cleanup()
-
-	db2, err := NewBriseDB()
+	db2, err := NewBriseDB(walPath)
 	if err != nil {
 		t.Fatalf("Failed to create BriseDB: %v", err)
 	}
@@ -140,4 +137,43 @@ func TestPersistence(t *testing.T) {
 	if !ok || val != "true" {
 		t.Error("Persistence failed: value not replayed from WAL")
 	}
+}
+
+func TestDeleteInTransaction(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	db.Set("key", "value")
+
+	db.BeginTransaction()
+	db.Delete("key")
+	val, ok := db.Get("key")
+	if ok {
+		t.Errorf("DELETE in transaction should hide key, got %q", val)
+	}
+	db.CommitTransaction()
+
+	_, ok = db.Get("key")
+	if ok {
+		t.Error("DELETE committed but key still visible")
+	}
+}
+
+func TestCountInTransaction(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	db.Set("a", "foo")
+	db.Set("b", "foo")
+
+	db.BeginTransaction()
+	db.Set("c", "foo")
+	db.Delete("a")
+
+	count := db.Count("foo")
+	if count != 2 {
+		t.Errorf("COUNT in transaction: expected 2, got %d", count)
+	}
+
+	db.RollbackTransaction()
 }

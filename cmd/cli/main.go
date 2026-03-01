@@ -13,7 +13,7 @@ import (
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 
-	db, err := brisedb.NewBriseDB()
+	db, err := brisedb.NewBriseDB("wal.log")
 	if err != nil {
 		logger.Error("failed to create database", "error", err)
 		os.Exit(1)
@@ -49,8 +49,6 @@ func executeCommand(db *brisedb.BriseDB, command string, args []string) error {
 		return db.RollbackTransaction()
 	case "COMMIT":
 		return db.CommitTransaction()
-	case "END":
-		return db.PopTransaction()
 	case "SET":
 		if len(args) < 2 {
 			return fmt.Errorf("ERROR: Missing key or value argument for SET")
@@ -75,6 +73,8 @@ func executeCommand(db *brisedb.BriseDB, command string, args []string) error {
 			return fmt.Errorf("ERROR: Missing value argument for COUNT")
 		}
 		fmt.Println(db.Count(args[0]))
+	case "COMPACT":
+		return db.Compact()
 	case "STOP":
 		os.Exit(0)
 	case "":

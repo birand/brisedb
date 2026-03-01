@@ -18,11 +18,12 @@ type BriseDB struct {
 	valueCounts  map[string]int
 	transactions *TransactionStack
 	walFile      *os.File
+	walPath      string
 }
 
-// NewBriseDB creates a new BriseDB instance
-func NewBriseDB() (*BriseDB, error) {
-	walFile, err := os.OpenFile("wal.log", os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
+// NewBriseDB creates a new BriseDB instance. walPath is the path to the WAL file.
+func NewBriseDB(walPath string) (*BriseDB, error) {
+	walFile, err := os.OpenFile(walPath, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open WAL file: %w", err)
 	}
@@ -32,6 +33,7 @@ func NewBriseDB() (*BriseDB, error) {
 		valueCounts:  make(map[string]int),
 		transactions: &TransactionStack{},
 		walFile:      walFile,
+		walPath:      walPath,
 	}
 
 	if err := db.replayWAL(); err != nil {
@@ -43,7 +45,6 @@ func NewBriseDB() (*BriseDB, error) {
 
 // replayWAL replays the operations from the WAL file
 func (db *BriseDB) replayWAL() error {
-	// Seek to the beginning of the file before replaying
 	if _, err := db.walFile.Seek(0, 0); err != nil {
 		return fmt.Errorf("failed to seek to the beginning of the WAL file: %w", err)
 	}
@@ -77,41 +78,85 @@ func (db *BriseDB) replayWAL() error {
 	return scanner.Err()
 }
 
-/* Transaction points to a key:value storage */
-type Transaction struct {
-	store map[string]string // every transaction has its own local store
-	next  *Transaction
+// Compact rewrites the WAL with only the current committed state, discarding history.
+func (db *BriseDB) Compact() error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	f, err := os.OpenFile(db.walPath, os.O_TRUNC|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to truncate WAL: %w", err)
+	}
+
+	w := bufio.NewWriter(f)
+	for key, value := range db.store {
+		op := struct {
+			Type  string
+			Key   string
+			Value string
+		}{"SET", key, value}
+		data, err := json.Marshal(op)
+		if err != nil {
+			f.Close()
+			return fmt.Errorf("failed to marshal WAL entry: %w", err)
+		}
+		if _, err := w.Write(append(data, '\n')); err != nil {
+			f.Close()
+			return fmt.Errorf("failed to write WAL entry: %w", err)
+		}
+	}
+
+	if err := w.Flush(); err != nil {
+		f.Close()
+		return fmt.Errorf("failed to flush WAL: %w", err)
+	}
+	f.Close()
+
+	// Reopen in append mode so subsequent writes work correctly
+	db.walFile.Close()
+	db.walFile, err = os.OpenFile(db.walPath, os.O_APPEND|os.O_RDWR, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to reopen WAL after compact: %w", err)
+	}
+
+	return nil
 }
 
-/* TransactionStack maintains a list of active/suspended transactions */
+// Transaction points to a key:value storage
+type Transaction struct {
+	store   map[string]string // keys set within this transaction
+	deleted map[string]bool   // keys deleted within this transaction
+	next    *Transaction
+}
+
+// TransactionStack maintains a list of active/suspended transactions
 type TransactionStack struct {
 	top  *Transaction
-	size int // more meta data can be saved like stack limit
+	size int
 }
 
-/* PushTransaction create a new active transaction */
+// PushTransaction creates a new active transaction
 func (ts *TransactionStack) PushTransaction() {
-	// Push a new Transaction, this is the current active transaction
-	temp := Transaction{store: make(Map)}
+	temp := Transaction{
+		store:   make(Map),
+		deleted: make(map[string]bool),
+	}
 	temp.next = ts.top
 	ts.top = &temp
 	ts.size++
 }
 
-/* PopTransaction deletes a transaction from stack */
+// PopTransaction deletes a transaction from the stack
 func (ts *TransactionStack) PopTransaction() error {
-	// Pop the Transaction from the stack, no longer active
 	if ts.top == nil {
-		// basically stack underflow
 		return fmt.Errorf("ERROR: No Active Transactions")
-	} else {
-		ts.top = ts.top.next
-		ts.size--
 	}
+	ts.top = ts.top.next
+	ts.size--
 	return nil
 }
 
-/* Peek returns the active transaction */
+// Peek returns the active transaction
 func (ts *TransactionStack) Peek() *Transaction {
 	return ts.top
 }
@@ -123,23 +168,28 @@ func (db *BriseDB) BeginTransaction() {
 	db.transactions.PushTransaction()
 }
 
-/*
-Commit write(SET) changes to the store with TransactionStack scope
-*/
+// CommitTransaction writes SET/DELETE changes to the parent transaction or main store.
 func (db *BriseDB) CommitTransaction() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	ActiveTransaction := db.transactions.Peek()
-	if ActiveTransaction == nil {
+	active := db.transactions.Peek()
+	if active == nil {
 		return fmt.Errorf("INFO: Nothing to commit")
 	}
 
-	// Merge the transaction store with the parent transaction store or the main store
-	for key, value := range ActiveTransaction.store {
-		if ActiveTransaction.next != nil {
-			ActiveTransaction.next.store[key] = value
-		} else {
-			// If the key already exists, decrement the count of the old value
+	if active.next != nil {
+		// Merge into parent transaction
+		for key, value := range active.store {
+			delete(active.next.deleted, key)
+			active.next.store[key] = value
+		}
+		for key := range active.deleted {
+			delete(active.next.store, key)
+			active.next.deleted[key] = true
+		}
+	} else {
+		// Merge into main store
+		for key, value := range active.store {
 			if oldValue, ok := db.store[key]; ok {
 				db.valueCounts[oldValue]--
 			}
@@ -151,14 +201,31 @@ func (db *BriseDB) CommitTransaction() error {
 				Key   string
 				Value string
 			}{"SET", key, value}
-
 			data, err := json.Marshal(op)
 			if err != nil {
 				return fmt.Errorf("failed to marshal WAL entry: %w", err)
 			}
-
 			if _, err := db.walFile.Write(append(data, '\n')); err != nil {
 				return fmt.Errorf("failed to write to WAL file: %w", err)
+			}
+		}
+
+		for key := range active.deleted {
+			if oldValue, ok := db.store[key]; ok {
+				db.valueCounts[oldValue]--
+				delete(db.store, key)
+
+				op := struct {
+					Type string
+					Key  string
+				}{"DELETE", key}
+				data, err := json.Marshal(op)
+				if err != nil {
+					return fmt.Errorf("failed to marshal WAL entry: %w", err)
+				}
+				if _, err := db.walFile.Write(append(data, '\n')); err != nil {
+					return fmt.Errorf("failed to write to WAL file: %w", err)
+				}
 			}
 		}
 	}
@@ -166,27 +233,22 @@ func (db *BriseDB) CommitTransaction() error {
 	return db.transactions.PopTransaction()
 }
 
-/* RollBackTransaction clears all keys SET within a transaction */
+// RollbackTransaction discards all changes within the current transaction.
 func (db *BriseDB) RollbackTransaction() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	return db.transactions.PopTransaction()
 }
 
-// PopTransaction removes the current transaction from the stack.
-func (db *BriseDB) PopTransaction() error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	return db.transactions.PopTransaction()
-}
-
-/* Get value of key from Store */
+// Get returns the value of key, checking the transaction stack before the main store.
 func (db *BriseDB) Get(key string) (string, bool) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
-	// Search in transaction stores first
 	tx := db.transactions.Peek()
 	for tx != nil {
+		if tx.deleted[key] {
+			return "", false
+		}
 		if val, ok := tx.store[key]; ok {
 			return val, true
 		}
@@ -196,76 +258,124 @@ func (db *BriseDB) Get(key string) (string, bool) {
 	if val, ok := db.store[key]; ok {
 		return val, true
 	}
-
 	return "", false
 }
 
-/* Set key to value */
+// Set assigns value to key.
 func (db *BriseDB) Set(key string, value string) error {
-	ActiveTransaction := db.transactions.Peek()
-	if ActiveTransaction != nil {
-		ActiveTransaction.store[key] = value
-	} else {
-		db.mu.Lock()
-		defer db.mu.Unlock()
-		// If the key already exists, decrement the count of the old value
-		if oldValue, ok := db.store[key]; ok {
-			db.valueCounts[oldValue]--
-		}
-		db.store[key] = value
-		db.valueCounts[value]++
+	db.mu.Lock()
+	defer db.mu.Unlock()
 
-		op := struct {
-			Type  string
-			Key   string
-			Value string
-		}{"SET", key, value}
+	active := db.transactions.Peek()
+	if active != nil {
+		delete(active.deleted, key)
+		active.store[key] = value
+		return nil
+	}
 
-		data, err := json.Marshal(op)
-		if err != nil {
-			return fmt.Errorf("failed to marshal WAL entry: %w", err)
-		}
+	if oldValue, ok := db.store[key]; ok {
+		db.valueCounts[oldValue]--
+	}
+	db.store[key] = value
+	db.valueCounts[value]++
 
-		if _, err := db.walFile.Write(append(data, '\n')); err != nil {
-			return fmt.Errorf("failed to write to WAL file: %w", err)
-		}
+	op := struct {
+		Type  string
+		Key   string
+		Value string
+	}{"SET", key, value}
+	data, err := json.Marshal(op)
+	if err != nil {
+		return fmt.Errorf("failed to marshal WAL entry: %w", err)
+	}
+	if _, err := db.walFile.Write(append(data, '\n')); err != nil {
+		return fmt.Errorf("failed to write to WAL file: %w", err)
 	}
 	return nil
 }
 
-/* Count returns the number of keys that have been set to the specified value */
+// Count returns the number of keys set to value, accounting for in-flight transactions.
 func (db *BriseDB) Count(value string) int {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
-	return db.valueCounts[value]
+
+	// Collect all keys touched by any transaction
+	touchedKeys := make(map[string]bool)
+	for tx := db.transactions.Peek(); tx != nil; tx = tx.next {
+		for k := range tx.store {
+			touchedKeys[k] = true
+		}
+		for k := range tx.deleted {
+			touchedKeys[k] = true
+		}
+	}
+
+	if len(touchedKeys) == 0 {
+		return db.valueCounts[value]
+	}
+
+	count := db.valueCounts[value]
+
+	for key := range touchedKeys {
+		// What the committed store has for this key
+		committedVal, committedExists := db.store[key]
+
+		// What the effective transaction state is for this key
+		txVal, txExists := db.effectiveTransactionValue(key)
+
+		// Adjust count: remove committed contribution, add tx contribution
+		if committedExists && committedVal == value {
+			count--
+		}
+		if txExists && txVal == value {
+			count++
+		}
+	}
+
+	return count
 }
 
-/* Delete value from Store */
+// effectiveTransactionValue returns the effective value for key from the transaction stack.
+// Must be called with at least mu.RLock held.
+func (db *BriseDB) effectiveTransactionValue(key string) (string, bool) {
+	for tx := db.transactions.Peek(); tx != nil; tx = tx.next {
+		if tx.deleted[key] {
+			return "", false
+		}
+		if val, ok := tx.store[key]; ok {
+			return val, true
+		}
+	}
+	return "", false
+}
+
+// Delete removes key from the store.
 func (db *BriseDB) Delete(key string) error {
-	ActiveTransaction := db.transactions.Peek()
-	if ActiveTransaction != nil {
-		delete(ActiveTransaction.store, key)
-	} else {
-		db.mu.Lock()
-		defer db.mu.Unlock()
-		if oldValue, ok := db.store[key]; ok {
-			db.valueCounts[oldValue]--
-		}
-		delete(db.store, key)
+	db.mu.Lock()
+	defer db.mu.Unlock()
 
-		op := struct {
-			Type string
-			Key  string
-		}{"DELETE", key}
+	active := db.transactions.Peek()
+	if active != nil {
+		delete(active.store, key)
+		active.deleted[key] = true
+		return nil
+	}
 
-		data, err := json.Marshal(op)
-		if err != nil {
-			return fmt.Errorf("failed to marshal WAL entry: %w", err)
-		}
+	if oldValue, ok := db.store[key]; ok {
+		db.valueCounts[oldValue]--
+	}
+	delete(db.store, key)
 
-		if _, err := db.walFile.Write(append(data, '\n')); err != nil {
-			return fmt.Errorf("failed to write to WAL file: %w", err)
-		}
+	op := struct {
+		Type string
+		Key  string
+	}{"DELETE", key}
+	data, err := json.Marshal(op)
+	if err != nil {
+		return fmt.Errorf("failed to marshal WAL entry: %w", err)
+	}
+	if _, err := db.walFile.Write(append(data, '\n')); err != nil {
+		return fmt.Errorf("failed to write to WAL file: %w", err)
 	}
 	return nil
 }
