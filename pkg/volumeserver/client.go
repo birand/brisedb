@@ -16,10 +16,24 @@ type Client struct {
 }
 
 // NewClient creates a Client for the volume server at baseURL (e.g. "http://host:8080").
+// Each Client gets its own http.Transport so its connection pool is not shared
+// with other clients or the process-wide http.DefaultTransport.
+// Pool sizing is tuned for concurrent blob writes (replication fan-out).
 func NewClient(baseURL string) *Client {
+	t := &http.Transport{
+		// Allow up to 64 idle keep-alive connections to this one server so
+		// concurrent replicated writes don't queue behind each other.
+		MaxIdleConnsPerHost: 64,
+		MaxConnsPerHost:     64,
+		// Keep connections alive for 90 s (well above a typical request RTT).
+		IdleConnTimeout:     90 * time.Second,
+		// Standard dial / TLS timeouts.
+		ResponseHeaderTimeout: 30 * time.Second,
+		DisableCompression:    true, // blobs are already binary; compression wastes CPU
+	}
 	return &Client{
 		baseURL: baseURL,
-		http:    &http.Client{Timeout: 30 * time.Second},
+		http:    &http.Client{Timeout: 30 * time.Second, Transport: t},
 	}
 }
 
