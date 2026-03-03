@@ -14,24 +14,20 @@ type Session struct {
 }
 
 // BeginTransaction starts a new transaction.
+// No lock needed — the transaction stack is per-session.
 func (s *Session) BeginTransaction() {
-	s.db.mu.Lock()
-	defer s.db.mu.Unlock()
 	s.transactions.PushTransaction()
 }
 
 // CommitTransaction writes SET/DELETE changes to the parent transaction or main store.
 func (s *Session) CommitTransaction() error {
-	s.db.mu.Lock()
-	defer s.db.mu.Unlock()
-
 	active := s.transactions.Peek()
 	if active == nil {
 		return fmt.Errorf("INFO: Nothing to commit")
 	}
 
 	if active.next != nil {
-		// Merge into parent transaction (no disk I/O)
+		// Merge into parent transaction — no shared state touched, no lock needed.
 		for key, value := range active.store {
 			delete(active.next.deleted, key)
 			active.next.store[key] = value
@@ -43,73 +39,103 @@ func (s *Session) CommitTransaction() error {
 		for key, exp := range active.expiry {
 			active.next.expiry[key] = exp
 		}
-	} else {
-		// Merge into main store
-		for key, value := range active.store {
-			addr, err := s.db.volumes.Write([]byte(value))
-			if err != nil {
-				return fmt.Errorf("commit: write volume: %w", err)
-			}
+		return s.transactions.PopTransaction()
+	}
 
-			var expiresAt int64
-			if exp, ok := active.expiry[key]; ok {
-				if exp.IsZero() {
-					delete(s.db.expiry, key)
-				} else {
-					s.db.expiry[key] = exp
-					expiresAt = exp.UnixNano()
-				}
-			} else {
-				delete(s.db.expiry, key)
-			}
+	// Merge into main store.
+	// Collect all affected keys so we can lock only the relevant shards.
+	allKeys := make([]string, 0, len(active.store)+len(active.deleted))
+	for k := range active.store {
+		allKeys = append(allKeys, k)
+	}
+	for k := range active.deleted {
+		allKeys = append(allKeys, k)
+	}
 
-			if err := s.db.hindex.Set(key, addr, expiresAt); err != nil {
-				return fmt.Errorf("commit: update index: %w", err)
-			}
-
-			walOp := walEntry{
-				Type:      "SET",
-				Key:       key,
-				VolumeID:  addr.VolumeID,
-				Offset:    addr.Offset,
-				Size:      addr.Size,
-				ExpiresAt: expiresAt,
-			}
-			if err := s.db.writeWAL(walOp); err != nil {
-				return err
-			}
-			s.fanoutSet(key, value, expiresAt)
+	// Write blobs outside the lock — volumes has its own synchronisation.
+	type pendingSet struct {
+		key       string
+		value     string
+		addr      NeedleAddr
+		expiresAt int64
+	}
+	sets := make([]pendingSet, 0, len(active.store))
+	for key, value := range active.store {
+		addr, err := s.db.volumes.Write([]byte(value))
+		if err != nil {
+			return fmt.Errorf("commit: write volume: %w", err)
 		}
-
-		for key := range active.deleted {
-			if _, _, ok := s.db.hindex.Get(key); ok {
-				if err := s.db.hindex.Delete(key); err != nil {
-					return fmt.Errorf("commit: delete index: %w", err)
-				}
-				if err := s.db.writeWAL(walEntry{Type: "DELETE", Key: key}); err != nil {
-					return err
-				}
-				s.fanoutDelete(key)
-			}
-			delete(s.db.expiry, key)
+		var expiresAt int64
+		if exp, ok := active.expiry[key]; ok && !exp.IsZero() {
+			expiresAt = exp.UnixNano()
 		}
+		sets = append(sets, pendingSet{key, value, addr, expiresAt})
+	}
+
+	// Lock only the shards we need, in sorted order.
+	idxs := s.db.mu.lockShards(allKeys)
+
+	for _, ps := range sets {
+		si := shardIndex(ps.key)
+		if ps.expiresAt > 0 {
+			s.db.expiry[si][ps.key] = time.Unix(0, ps.expiresAt)
+		} else {
+			delete(s.db.expiry[si], ps.key)
+		}
+		if err := s.db.hindex.Set(ps.key, ps.addr, ps.expiresAt); err != nil {
+			s.db.mu.unlockShards(idxs)
+			return fmt.Errorf("commit: update index: %w", err)
+		}
+	}
+
+	for key := range active.deleted {
+		si := shardIndex(key)
+		if _, _, ok := s.db.hindex.Get(key); ok {
+			if err := s.db.hindex.Delete(key); err != nil {
+				s.db.mu.unlockShards(idxs)
+				return fmt.Errorf("commit: delete index: %w", err)
+			}
+		}
+		delete(s.db.expiry[si], key)
+	}
+
+	s.db.mu.unlockShards(idxs)
+
+	// WAL writes are serialised by walMu inside writeWAL.
+	for _, ps := range sets {
+		if err := s.db.writeWAL(walEntry{
+			Type:      "SET",
+			Key:       ps.key,
+			VolumeID:  ps.addr.VolumeID,
+			Offset:    ps.addr.Offset,
+			Size:      ps.addr.Size,
+			ExpiresAt: ps.expiresAt,
+		}); err != nil {
+			return err
+		}
+		s.fanoutSet(ps.key, ps.value, ps.expiresAt)
+	}
+	for key := range active.deleted {
+		if err := s.db.writeWAL(walEntry{Type: "DELETE", Key: key}); err != nil {
+			return err
+		}
+		s.fanoutDelete(key)
 	}
 
 	return s.transactions.PopTransaction()
 }
 
 // RollbackTransaction discards all changes within the current transaction.
+// No lock needed — the transaction stack is per-session.
 func (s *Session) RollbackTransaction() error {
-	s.db.mu.Lock()
-	defer s.db.mu.Unlock()
 	return s.transactions.PopTransaction()
 }
 
 // Get returns the value of key, checking the transaction stack before the main store.
 // Expired keys are treated as absent.
 func (s *Session) Get(key string) (string, bool) {
-	s.db.mu.RLock()
-	defer s.db.mu.RUnlock()
+	s.db.mu.RLock(key)
+	defer s.db.mu.RUnlock(key)
 
 	// Check transaction stack first (in-memory, no disk I/O)
 	tx := s.transactions.Peek()
@@ -140,9 +166,6 @@ func (s *Session) Get(key string) (string, bool) {
 
 // Set assigns value to key, clearing any existing TTL.
 func (s *Session) Set(key, value string) error {
-	s.db.mu.Lock()
-	defer s.db.mu.Unlock()
-
 	active := s.transactions.Peek()
 	if active != nil {
 		delete(active.deleted, key)
@@ -155,10 +178,14 @@ func (s *Session) Set(key, value string) error {
 	if err != nil {
 		return fmt.Errorf("set: write volume: %w", err)
 	}
+
+	s.db.mu.Lock(key)
 	if err := s.db.hindex.Set(key, addr, 0); err != nil {
+		s.db.mu.Unlock(key)
 		return fmt.Errorf("set: update index: %w", err)
 	}
-	delete(s.db.expiry, key)
+	delete(s.db.expiry[shardIndex(key)], key)
+	s.db.mu.Unlock(key)
 
 	if err := s.db.writeWAL(walEntry{
 		Type:     "SET",
@@ -180,9 +207,6 @@ func (s *Session) SetEX(key, value string, ttl time.Duration) error {
 	}
 	exp := time.Now().Add(ttl)
 
-	s.db.mu.Lock()
-	defer s.db.mu.Unlock()
-
 	active := s.transactions.Peek()
 	if active != nil {
 		delete(active.deleted, key)
@@ -195,10 +219,14 @@ func (s *Session) SetEX(key, value string, ttl time.Duration) error {
 	if err != nil {
 		return fmt.Errorf("setex: write volume: %w", err)
 	}
+
+	s.db.mu.Lock(key)
 	if err := s.db.hindex.Set(key, addr, exp.UnixNano()); err != nil {
+		s.db.mu.Unlock(key)
 		return fmt.Errorf("setex: update index: %w", err)
 	}
-	s.db.expiry[key] = exp
+	s.db.expiry[shardIndex(key)][key] = exp
+	s.db.mu.Unlock(key)
 
 	if err := s.db.writeWAL(walEntry{
 		Type:      "SET",
@@ -235,25 +263,27 @@ func (s *Session) SetBlob(key string, data []byte, ttl time.Duration) error {
 		exp = time.Now().Add(ttl)
 	}
 
-	s.db.mu.Lock()
-	defer s.db.mu.Unlock()
-
 	addr, err := s.db.volumes.Write(data)
 	if err != nil {
 		return fmt.Errorf("setblob: write volume: %w", err)
 	}
 
 	var expiresAt int64
+	si := shardIndex(key)
+
+	s.db.mu.Lock(key)
 	if !exp.IsZero() {
 		expiresAt = exp.UnixNano()
-		s.db.expiry[key] = exp
+		s.db.expiry[si][key] = exp
 	} else {
-		delete(s.db.expiry, key)
+		delete(s.db.expiry[si], key)
 	}
-
 	if err := s.db.hindex.Set(key, addr, expiresAt); err != nil {
+		s.db.mu.Unlock(key)
 		return fmt.Errorf("setblob: update index: %w", err)
 	}
+	s.db.mu.Unlock(key)
+
 	if err := s.db.writeWAL(walEntry{
 		Type:      "SET",
 		Key:       key,
@@ -271,8 +301,8 @@ func (s *Session) SetBlob(key string, data []byte, ttl time.Duration) error {
 // GetBlobMeta returns the volume address and expiry for key without reading
 // the blob data.  Returns (BlobMeta{}, false) if the key is absent or expired.
 func (s *Session) GetBlobMeta(key string) (BlobMeta, bool) {
-	s.db.mu.RLock()
-	defer s.db.mu.RUnlock()
+	s.db.mu.RLock(key)
+	defer s.db.mu.RUnlock(key)
 
 	addr, expiresAt, ok := s.db.hindex.Get(key)
 	if !ok {
@@ -305,9 +335,6 @@ func (s *Session) ReadBlobAt(addr NeedleAddr, start, length int64) ([]byte, erro
 
 // Delete removes key from the store.
 func (s *Session) Delete(key string) error {
-	s.db.mu.Lock()
-	defer s.db.mu.Unlock()
-
 	active := s.transactions.Peek()
 	if active != nil {
 		delete(active.store, key)
@@ -316,14 +343,20 @@ func (s *Session) Delete(key string) error {
 		return nil
 	}
 
-	if _, _, ok := s.db.hindex.Get(key); !ok {
-		return nil // key doesn't exist; nothing to do
+	s.db.mu.Lock(key)
+	_, _, exists := s.db.hindex.Get(key)
+	if exists {
+		if err := s.db.hindex.Delete(key); err != nil {
+			s.db.mu.Unlock(key)
+			return fmt.Errorf("delete: update index: %w", err)
+		}
+		delete(s.db.expiry[shardIndex(key)], key)
 	}
-	if err := s.db.hindex.Delete(key); err != nil {
-		return fmt.Errorf("delete: update index: %w", err)
-	}
-	delete(s.db.expiry, key)
+	s.db.mu.Unlock(key)
 
+	if !exists {
+		return nil
+	}
 	if err := s.db.writeWAL(walEntry{Type: "DELETE", Key: key}); err != nil {
 		return err
 	}
@@ -335,8 +368,8 @@ func (s *Session) Delete(key string) error {
 // Returns -1 if the key exists but has no expiry.
 // Returns -2 if the key does not exist or has already expired.
 func (s *Session) TTL(key string) int64 {
-	s.db.mu.RLock()
-	defer s.db.mu.RUnlock()
+	s.db.mu.RLock(key)
+	defer s.db.mu.RUnlock(key)
 
 	tx := s.transactions.Peek()
 	for tx != nil {
@@ -373,9 +406,6 @@ func (s *Session) TTL(key string) int64 {
 // Persist removes the TTL from key.
 // Returns true if the key existed and had a TTL.
 func (s *Session) Persist(key string) bool {
-	s.db.mu.Lock()
-	defer s.db.mu.Unlock()
-
 	active := s.transactions.Peek()
 	if active != nil {
 		if _, ok := active.store[key]; ok {
@@ -384,12 +414,15 @@ func (s *Session) Persist(key string) bool {
 		}
 	}
 
+	s.db.mu.Lock(key)
+	defer s.db.mu.Unlock(key)
+
 	addr, expiresAt, ok := s.db.hindex.Get(key)
 	if !ok || expiresAt == 0 {
 		return false
 	}
 	s.db.hindex.Set(key, addr, 0) //nolint:errcheck
-	delete(s.db.expiry, key)
+	delete(s.db.expiry[shardIndex(key)], key)
 	return true
 }
 
@@ -398,8 +431,7 @@ func (s *Session) Persist(key string) bool {
 func (s *Session) Count(value string) int {
 	now := time.Now()
 
-	// Snapshot tx overrides under the read lock
-	s.db.mu.RLock()
+	// Snapshot tx overrides — tx stack is per-session, no shared lock needed.
 	txOverride := make(map[string]string)
 	txDeleted := make(map[string]bool)
 	for tx := s.transactions.Peek(); tx != nil; tx = tx.next {
@@ -414,7 +446,6 @@ func (s *Session) Count(value string) int {
 			}
 		}
 	}
-	s.db.mu.RUnlock()
 
 	count := 0
 
