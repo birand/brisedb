@@ -11,8 +11,10 @@ import (
 
 // Config holds all server settings.
 type Config struct {
-	Addr    string `json:"addr"`     // TCP listen address (default ":6380")
-	DataDir string `json:"data_dir"` // database directory (default "brisedb-data")
+	Addr          string   `json:"addr"`            // TCP listen address (default ":6380")
+	DataDir       string   `json:"data_dir"`        // primary database directory
+	Drives        []string `json:"drives"`          // additional storage drives
+	MaxVolumeSize uint64   `json:"max_volume_size"` // bytes per volume, 0 = 2 GiB
 }
 
 // defaults returns a Config pre-filled with default values.

@@ -112,7 +112,7 @@ func (s *Server) handleConn(conn net.Conn) {
 		// Replica mode: only allow reads, REPLICATE is only for primary→replica handshake.
 		if s.ReadOnly {
 			switch cmd {
-			case "GET", "COUNT", "TTL", "KEYS", "SCAN", "STOP":
+			case "GET", "COUNT", "TTL", "KEYS", "SCAN", "STOP", "VOLINFO":
 				// allowed
 			default:
 				respond("-ERROR: server is read-only")
@@ -280,6 +280,13 @@ func (s *Server) handleConn(conn net.Conn) {
 				respond("-" + err.Error())
 			} else {
 				respond("+OK")
+			}
+		case "VOLINFO":
+			// VOLINFO — returns one line per volume: +<id> <drive> <size_bytes>
+			stats := s.db.VolumeStats()
+			respond(fmt.Sprintf("+%d", len(stats)))
+			for _, vi := range stats {
+				respond(fmt.Sprintf("+%d %s %d", vi.VolumeID, vi.Drive, vi.Size))
 			}
 		case "STOP":
 			respond("+OK")

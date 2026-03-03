@@ -40,11 +40,28 @@ type BriseDB struct {
 	stopCh      chan struct{}
 }
 
+// DBOptions configures optional behaviour of NewBriseDB.
+type DBOptions struct {
+	// ExtraDrives lists additional directories for volume files.
+	// The primary drive is always dataDir/volumes.
+	ExtraDrives []string
+
+	// MaxVolumeSize is the maximum size in bytes of a single volume file
+	// before a new one is created. 0 means DefaultMaxVolumeSize (2 GiB).
+	MaxVolumeSize uint64
+}
+
 // NewBriseDB opens (or creates) the database at dataDir.
-// The WAL is stored at dataDir/wal.log; volume files at dataDir/volumes/.
-func NewBriseDB(dataDir string) (*BriseDB, error) {
+// The WAL is stored at dataDir/wal.log; volume files at dataDir/volumes/
+// and any ExtraDrives specified in opts.
+func NewBriseDB(dataDir string, opts ...DBOptions) (*BriseDB, error) {
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
 		return nil, fmt.Errorf("create data dir: %w", err)
+	}
+
+	var opt DBOptions
+	if len(opts) > 0 {
+		opt = opts[0]
 	}
 
 	walPath := filepath.Join(dataDir, "wal.log")
@@ -53,8 +70,8 @@ func NewBriseDB(dataDir string) (*BriseDB, error) {
 		return nil, fmt.Errorf("open WAL: %w", err)
 	}
 
-	volDir := filepath.Join(dataDir, "volumes")
-	volumes, err := newVolumeManager(volDir)
+	drives := append([]string{filepath.Join(dataDir, "volumes")}, opt.ExtraDrives...)
+	volumes, err := newVolumeManager(drives, opt.MaxVolumeSize)
 	if err != nil {
 		walFile.Close()
 		return nil, fmt.Errorf("open volumes: %w", err)
@@ -306,6 +323,9 @@ func (db *BriseDB) ApplyReplicationEntry(data []byte) error {
 
 // Replication returns the replication manager (used by the server handler).
 func (db *BriseDB) Replication() *replicationManager { return db.replication }
+
+// VolumeStats returns info about all open volume files across all drives.
+func (db *BriseDB) VolumeStats() []VolumeInfo { return db.volumes.Stats() }
 
 // ------------------------------------------------------------------ //
 // Transaction types

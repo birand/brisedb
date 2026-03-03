@@ -29,9 +29,13 @@ func main() {
 
 	cfg.Apply(*addr, *dataDir)
 
-	logger.Info("starting brisedb", "addr", cfg.Addr, "data", cfg.DataDir)
+	logger.Info("starting brisedb", "addr", cfg.Addr, "data", cfg.DataDir,
+		"drives", cfg.Drives, "max_volume_size", cfg.MaxVolumeSize)
 
-	db, err := brisedb.NewBriseDB(cfg.DataDir)
+	db, err := brisedb.NewBriseDB(cfg.DataDir, brisedb.DBOptions{
+		ExtraDrives:   cfg.Drives,
+		MaxVolumeSize: cfg.MaxVolumeSize,
+	})
 	if err != nil {
 		logger.Error("failed to open database", "error", err)
 		os.Exit(1)
