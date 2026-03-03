@@ -3,6 +3,7 @@ package brisedb
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"sort"
 	"time"
 )
@@ -295,6 +296,51 @@ func (s *Session) SetBlob(key string, data []byte, ttl time.Duration) error {
 		return err
 	}
 	s.fanoutSet(key, string(data), expiresAt)
+	return nil
+}
+
+// SetBlobStream streams size bytes from r directly into the volume, writing
+// the 8-byte length header first so no RAM buffer is needed.
+// The caller must supply the exact size (i.e. Content-Length must be known).
+// Any active transaction is ignored — this is always an immediate commit.
+// ttl <= 0 means no expiry.
+func (s *Session) SetBlobStream(key string, r io.Reader, size int64, ttl time.Duration) error {
+	var exp time.Time
+	if ttl > 0 {
+		exp = time.Now().Add(ttl)
+	}
+
+	addr, err := s.db.volumes.WriteStream(r, size)
+	if err != nil {
+		return fmt.Errorf("setblobstream: write volume: %w", err)
+	}
+
+	var expiresAt int64
+	si := shardIndex(key)
+
+	s.db.mu.Lock(key)
+	if !exp.IsZero() {
+		expiresAt = exp.UnixNano()
+		s.db.expiry[si][key] = exp
+	} else {
+		delete(s.db.expiry[si], key)
+	}
+	if err := s.db.hindex.Set(key, addr, expiresAt); err != nil {
+		s.db.mu.Unlock(key)
+		return fmt.Errorf("setblobstream: update index: %w", err)
+	}
+	s.db.mu.Unlock(key)
+
+	if err := s.db.writeWAL(walEntry{
+		Type:      "SET",
+		Key:       key,
+		VolumeID:  addr.VolumeID,
+		Offset:    addr.Offset,
+		Size:      addr.Size,
+		ExpiresAt: expiresAt,
+	}); err != nil {
+		return err
+	}
 	return nil
 }
 

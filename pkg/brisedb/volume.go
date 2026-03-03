@@ -3,6 +3,7 @@ package brisedb
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -74,6 +75,30 @@ func (v *volume) write(data []byte) (NeedleAddr, error) {
 	}
 	v.end += 8 + uint64(len(data))
 	return NeedleAddr{VolumeID: v.id, Offset: offset, Size: uint64(len(data))}, nil
+}
+
+// writeStream streams size bytes from r into the volume without buffering the
+// payload in RAM. The caller must know the exact size in advance so the 8-byte
+// length header can be written first.
+func (v *volume) writeStream(r io.Reader, size int64) (NeedleAddr, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	offset := v.end
+	var hdr [8]byte
+	binary.BigEndian.PutUint64(hdr[:], uint64(size))
+	if _, err := v.f.Write(hdr[:]); err != nil {
+		return NeedleAddr{}, fmt.Errorf("volume %d: write header: %w", v.id, err)
+	}
+	n, err := io.Copy(v.f, r)
+	if err != nil {
+		return NeedleAddr{}, fmt.Errorf("volume %d: stream data: %w", v.id, err)
+	}
+	if n != size {
+		return NeedleAddr{}, fmt.Errorf("volume %d: expected %d bytes, got %d", v.id, size, n)
+	}
+	v.end += 8 + uint64(size)
+	return NeedleAddr{VolumeID: v.id, Offset: offset, Size: uint64(size)}, nil
 }
 
 func (v *volume) read(addr NeedleAddr) ([]byte, error) {
@@ -283,6 +308,30 @@ func (vm *VolumeManager) Write(data []byte) (NeedleAddr, error) {
 
 	vm.mu.Unlock()
 	return v.write(data)
+}
+
+// WriteStream streams size bytes from r into the next available drive volume.
+// The caller must supply the exact Content-Length so the header can be written
+// before the payload arrives. For unknown sizes, buffer first and use Write.
+func (vm *VolumeManager) WriteStream(r io.Reader, size int64) (NeedleAddr, error) {
+	vm.mu.Lock()
+
+	di := vm.driveIdx % len(vm.drives)
+	vm.driveIdx++
+
+	v := vm.driveCurrent[di]
+
+	if v.size() >= vm.maxVolumeSize {
+		newV, err := vm.createVolume(di, vm.drives[di])
+		if err != nil {
+			vm.mu.Unlock()
+			return NeedleAddr{}, err
+		}
+		v = newV
+	}
+
+	vm.mu.Unlock()
+	return v.writeStream(r, size)
 }
 
 // Read retrieves a blob by its needle address.

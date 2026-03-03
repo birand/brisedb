@@ -94,17 +94,30 @@ func (s *Server) putBlob(w http.ResponseWriter, r *http.Request, key string) {
 		}
 	}
 
-	data, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("read body: %v", err), http.StatusBadRequest)
-		return
-	}
-
 	sess := s.db.NewSession()
-	if err := sess.SetBlob(key, data, ttl); err != nil {
-		s.log.Error("putBlob failed", "key", key, "error", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+	var blobSize int64
+
+	if r.ContentLength >= 0 {
+		// Content-Length known: stream directly to the volume without buffering.
+		if err := sess.SetBlobStream(key, r.Body, r.ContentLength, ttl); err != nil {
+			s.log.Error("putBlob stream failed", "key", key, "error", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		blobSize = r.ContentLength
+	} else {
+		// Content-Length unknown (chunked encoding): buffer in RAM.
+		data, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("read body: %v", err), http.StatusBadRequest)
+			return
+		}
+		if err := sess.SetBlob(key, data, ttl); err != nil {
+			s.log.Error("putBlob failed", "key", key, "error", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		blobSize = int64(len(data))
 	}
 
 	var expiresAt int64
@@ -116,7 +129,7 @@ func (s *Server) putBlob(w http.ResponseWriter, r *http.Request, key string) {
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(map[string]any{
 		"key":        key,
-		"size":       len(data),
+		"size":       blobSize,
 		"expires_at": expiresAt,
 	})
 }

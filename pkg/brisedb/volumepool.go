@@ -3,6 +3,7 @@ package brisedb
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -134,6 +135,30 @@ func (p *VolumePool) Write(data []byte) (NeedleAddr, error) {
 	}
 
 	return NeedleAddr{VolumeID: group.ID, Offset: primaryAddr.Offset, Size: primaryAddr.Size}, nil
+}
+
+// WriteStream streams size bytes from r into the active volume group without
+// buffering the payload in RAM. When replication is enabled (>1 member), it
+// falls back to buffering via io.ReadAll so the data can be sent to all members.
+func (p *VolumePool) WriteStream(r io.Reader, size int64) (NeedleAddr, error) {
+	p.mu.Lock()
+	group, err := p.getOrCreateGroup()
+	p.mu.Unlock()
+	if err != nil {
+		return NeedleAddr{}, err
+	}
+
+	// Single local member: stream directly, no buffer needed.
+	if len(group.Members) == 1 && group.Members[0].ServerURL == "" {
+		return p.local.WriteStream(r, size)
+	}
+
+	// Replication: buffer once, then fan out (same as Write).
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return NeedleAddr{}, fmt.Errorf("stream read for replication: %w", err)
+	}
+	return p.Write(data)
 }
 
 // Read retrieves a blob, checking the LRU cache first.
