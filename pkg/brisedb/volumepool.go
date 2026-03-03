@@ -56,12 +56,14 @@ type VolumePool struct {
 	activeGroup       *volumeGroup // current write target (nil = none yet)
 	replicationFactor int          // total copies per group (1 = no replication)
 	registryPath      string
+	cache             *lruCache // nil = disabled
 }
 
 // newVolumePool creates a VolumePool.
 // replicationFactor controls how many copies each blob gets (default 1).
+// cacheBytes sets the in-memory LRU read cache size (0 = disabled).
 // Existing local volumes are registered for backward compatibility.
-func newVolumePool(local *VolumeManager, remotes []*volumeserver.Client, dataDir string, replicationFactor int) (*VolumePool, error) {
+func newVolumePool(local *VolumeManager, remotes []*volumeserver.Client, dataDir string, replicationFactor int, cacheBytes uint64) (*VolumePool, error) {
 	if replicationFactor < 1 {
 		replicationFactor = 1
 	}
@@ -71,6 +73,7 @@ func newVolumePool(local *VolumeManager, remotes []*volumeserver.Client, dataDir
 		registry:          make(map[uint32]*volumeGroup),
 		replicationFactor: replicationFactor,
 		registryPath:      filepath.Join(dataDir, "vol-registry.json"),
+		cache:             newLRUCache(cacheBytes),
 	}
 
 	if err := p.loadRegistry(); err != nil {
@@ -133,26 +136,59 @@ func (p *VolumePool) Write(data []byte) (NeedleAddr, error) {
 	return NeedleAddr{VolumeID: group.ID, Offset: primaryAddr.Offset, Size: primaryAddr.Size}, nil
 }
 
-// Read retrieves a blob, trying members in order for automatic failover.
+// Read retrieves a blob, checking the LRU cache first.
+// On a cache miss it tries group members in order (automatic failover)
+// and populates the cache on success.
 func (p *VolumePool) Read(addr NeedleAddr) ([]byte, error) {
+	// Cache lookup — no lock needed, lruCache is internally synchronized.
+	if p.cache != nil {
+		if data, ok := p.cache.get(addr); ok {
+			return data, nil
+		}
+	}
+
 	p.mu.Lock()
 	group := p.registry[addr.VolumeID]
 	p.mu.Unlock()
 
+	var (
+		data    []byte
+		lastErr error
+	)
+
 	if group == nil {
 		// Legacy data: assume single local member.
-		return p.local.Read(addr)
+		data, lastErr = p.local.Read(addr)
+	} else {
+		for _, m := range group.Members {
+			data, lastErr = p.readFromMember(m, group.ID, addr.Offset, addr.Size)
+			if lastErr == nil {
+				break
+			}
+		}
+		if lastErr != nil {
+			return nil, fmt.Errorf("volume group %d: all members failed (last: %w)", addr.VolumeID, lastErr)
+		}
 	}
 
-	var lastErr error
-	for _, m := range group.Members {
-		data, err := p.readFromMember(m, group.ID, addr.Offset, addr.Size)
-		if err == nil {
-			return data, nil
-		}
-		lastErr = err
+	if lastErr != nil {
+		return nil, lastErr
 	}
-	return nil, fmt.Errorf("volume group %d: all members failed (last: %w)", addr.VolumeID, lastErr)
+
+	// Populate cache for future reads.
+	if p.cache != nil {
+		p.cache.set(addr, data)
+	}
+	return data, nil
+}
+
+// CacheStats returns LRU cache metrics. Returns zero-value stats if the
+// cache is disabled.
+func (p *VolumePool) CacheStats() LRUStats {
+	if p.cache == nil {
+		return LRUStats{}
+	}
+	return p.cache.Stats()
 }
 
 // EnsureVolume opens a local volume by ID (used during WAL replay).

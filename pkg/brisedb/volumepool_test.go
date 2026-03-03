@@ -12,7 +12,7 @@ import (
 func newTestPool(t *testing.T, rf int, remotes ...*volumeserver.Client) *VolumePool {
 	t.Helper()
 	vm := newTestVM(t, 0)
-	pool, err := newVolumePool(vm, remotes, t.TempDir(), rf)
+	pool, err := newVolumePool(vm, remotes, t.TempDir(), rf, 0)
 	if err != nil {
 		t.Fatalf("newVolumePool: %v", err)
 	}
@@ -147,7 +147,7 @@ func TestVolumePool_RegistryPersistence(t *testing.T) {
 	dir := t.TempDir()
 	vm := newTestVM(t, 0)
 
-	pool, err := newVolumePool(vm, nil, dir, 1)
+	pool, err := newVolumePool(vm, nil, dir, 1, 0)
 	if err != nil {
 		t.Fatalf("newVolumePool: %v", err)
 	}
@@ -158,7 +158,7 @@ func TestVolumePool_RegistryPersistence(t *testing.T) {
 		t.Fatalf("Write: %v", err)
 	}
 
-	pool2, err := newVolumePool(vm, nil, dir, 1)
+	pool2, err := newVolumePool(vm, nil, dir, 1, 0)
 	if err != nil {
 		t.Fatalf("reload newVolumePool: %v", err)
 	}

@@ -270,10 +270,20 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	for i, v := range stats {
 		vs[i] = volStat{v.VolumeID, v.Drive, v.Path, v.Size}
 	}
+	cs := s.db.CacheStats()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
 		"status":  "ok",
 		"volumes": vs,
+		"cache": map[string]any{
+			"entries":    cs.Entries,
+			"bytes_used": cs.BytesUsed,
+			"bytes_max":  cs.BytesMax,
+			"hits":       cs.Hits,
+			"misses":     cs.Misses,
+			"hit_rate":   cs.HitRate(),
+			"evictions":  cs.Evictions,
+		},
 	})
 }
 

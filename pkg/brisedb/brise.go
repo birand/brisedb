@@ -61,6 +61,11 @@ type DBOptions struct {
 	// across the available backends. 1 = no replication (default).
 	// Must be ≤ len(VolumeServers) + 1 (local counts as one backend).
 	ReplicationFactor int
+
+	// CacheSize is the maximum number of bytes to hold in the in-memory
+	// LRU read cache. 0 disables caching (default).
+	// Example: 256 * 1024 * 1024 for a 256 MiB cache.
+	CacheSize uint64
 }
 
 // NewBriseDB opens (or creates) the database at dataDir.
@@ -95,7 +100,7 @@ func NewBriseDB(dataDir string, opts ...DBOptions) (*BriseDB, error) {
 		remotes = append(remotes, volumeserver.NewClient(url))
 	}
 
-	volumes, err := newVolumePool(localVM, remotes, dataDir, opt.ReplicationFactor)
+	volumes, err := newVolumePool(localVM, remotes, dataDir, opt.ReplicationFactor, opt.CacheSize)
 	if err != nil {
 		walFile.Close()
 		localVM.Close()
@@ -371,6 +376,10 @@ func (db *BriseDB) Replication() *replicationManager { return db.replication }
 
 // VolumeStats returns info about all open volume files across all drives.
 func (db *BriseDB) VolumeStats() []VolumeInfo { return db.volumes.Stats() }
+
+// CacheStats returns LRU read-cache metrics.
+// All fields are zero if the cache is disabled (CacheSize == 0).
+func (db *BriseDB) CacheStats() LRUStats { return db.volumes.CacheStats() }
 
 // ------------------------------------------------------------------ //
 // Transaction types

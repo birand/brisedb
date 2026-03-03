@@ -43,6 +43,7 @@ func main() {
 		VolumeServers:     cfg.VolumeServers,
 		MaxVolumeSize:     cfg.MaxVolumeSize,
 		ReplicationFactor: cfg.ReplicationFactor,
+		CacheSize:         cfg.CacheSize,
 	})
 	if err != nil {
 		logger.Error("failed to open database", "error", err)
