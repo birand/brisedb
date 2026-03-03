@@ -15,6 +15,7 @@ type Config struct {
 	DataDir       string   `json:"data_dir"`        // primary database directory
 	Drives        []string `json:"drives"`          // additional storage drives
 	MaxVolumeSize uint64   `json:"max_volume_size"` // bytes per volume, 0 = 2 GiB
+	VolumeServers []string `json:"volume_servers"`  // remote HTTP volume server URLs
 }
 
 // defaults returns a Config pre-filled with default values.

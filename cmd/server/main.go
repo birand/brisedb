@@ -34,6 +34,7 @@ func main() {
 
 	db, err := brisedb.NewBriseDB(cfg.DataDir, brisedb.DBOptions{
 		ExtraDrives:   cfg.Drives,
+		VolumeServers: cfg.VolumeServers,
 		MaxVolumeSize: cfg.MaxVolumeSize,
 	})
 	if err != nil {

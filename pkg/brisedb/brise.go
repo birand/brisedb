@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/birand/brisedb/pkg/volumeserver"
 )
 
 /* Map string:string */
@@ -34,7 +36,7 @@ type BriseDB struct {
 	expiry      map[string]time.Time // in-memory cache of TTL keys (subset of hindex)
 	pubsub      *PubSub
 	replication *replicationManager
-	volumes     *VolumeManager
+	volumes     *VolumePool
 	walFile     *os.File
 	walPath     string
 	stopCh      chan struct{}
@@ -42,13 +44,18 @@ type BriseDB struct {
 
 // DBOptions configures optional behaviour of NewBriseDB.
 type DBOptions struct {
-	// ExtraDrives lists additional directories for volume files.
+	// ExtraDrives lists additional local directories for volume files.
 	// The primary drive is always dataDir/volumes.
 	ExtraDrives []string
 
 	// MaxVolumeSize is the maximum size in bytes of a single volume file
 	// before a new one is created. 0 means DefaultMaxVolumeSize (2 GiB).
 	MaxVolumeSize uint64
+
+	// VolumeServers is an optional list of remote HTTP volume server base URLs
+	// (e.g. "http://10.0.0.2:8081"). When set, blob writes are distributed
+	// across local drives and remote servers in round-robin order.
+	VolumeServers []string
 }
 
 // NewBriseDB opens (or creates) the database at dataDir.
@@ -71,10 +78,23 @@ func NewBriseDB(dataDir string, opts ...DBOptions) (*BriseDB, error) {
 	}
 
 	drives := append([]string{filepath.Join(dataDir, "volumes")}, opt.ExtraDrives...)
-	volumes, err := newVolumeManager(drives, opt.MaxVolumeSize)
+	localVM, err := newVolumeManager(drives, opt.MaxVolumeSize)
 	if err != nil {
 		walFile.Close()
 		return nil, fmt.Errorf("open volumes: %w", err)
+	}
+
+	// Build remote volume server clients.
+	remotes := make([]*volumeserver.Client, 0, len(opt.VolumeServers))
+	for _, url := range opt.VolumeServers {
+		remotes = append(remotes, volumeserver.NewClient(url))
+	}
+
+	volumes, err := newVolumePool(localVM, remotes, dataDir)
+	if err != nil {
+		walFile.Close()
+		localVM.Close()
+		return nil, fmt.Errorf("open volume pool: %w", err)
 	}
 
 	idxPath := filepath.Join(dataDir, "index.hash")

@@ -119,8 +119,14 @@ type VolumeManager struct {
 	maxVolumeSize uint64
 }
 
-// newVolumeManager opens (or creates) volumes in each drive directory.
-// drives must contain at least one entry.
+// NewVolumeManager opens (or creates) volumes in each drive directory.
+// drives must contain at least one entry. Exported for use by external
+// tools such as the standalone volume server binary.
+func NewVolumeManager(drives []string, maxVolumeSize uint64) (*VolumeManager, error) {
+	return newVolumeManager(drives, maxVolumeSize)
+}
+
+// newVolumeManager is the internal constructor.
 func newVolumeManager(drives []string, maxVolumeSize uint64) (*VolumeManager, error) {
 	if maxVolumeSize == 0 {
 		maxVolumeSize = DefaultMaxVolumeSize
