@@ -214,6 +214,95 @@ func (s *Session) SetEX(key, value string, ttl time.Duration) error {
 	return nil
 }
 
+// ------------------------------------------------------------------ //
+// Blob API — direct byte-slice I/O, bypasses transaction buffer.
+// Use these for large values (>1 MB) where buffering in tx.store
+// would cause excessive memory pressure.
+// ------------------------------------------------------------------ //
+
+// BlobMeta holds metadata returned by GetBlobAddr.
+type BlobMeta struct {
+	Addr      NeedleAddr
+	ExpiresAt int64 // Unix nanoseconds; 0 = no expiry
+}
+
+// SetBlob writes data directly to the volume and updates the index.
+// Any active transaction is ignored — this is always an immediate commit.
+// ttl <= 0 means no expiry.
+func (s *Session) SetBlob(key string, data []byte, ttl time.Duration) error {
+	var exp time.Time
+	if ttl > 0 {
+		exp = time.Now().Add(ttl)
+	}
+
+	s.db.mu.Lock()
+	defer s.db.mu.Unlock()
+
+	addr, err := s.db.volumes.Write(data)
+	if err != nil {
+		return fmt.Errorf("setblob: write volume: %w", err)
+	}
+
+	var expiresAt int64
+	if !exp.IsZero() {
+		expiresAt = exp.UnixNano()
+		s.db.expiry[key] = exp
+	} else {
+		delete(s.db.expiry, key)
+	}
+
+	if err := s.db.hindex.Set(key, addr, expiresAt); err != nil {
+		return fmt.Errorf("setblob: update index: %w", err)
+	}
+	if err := s.db.writeWAL(walEntry{
+		Type:      "SET",
+		Key:       key,
+		VolumeID:  addr.VolumeID,
+		Offset:    addr.Offset,
+		Size:      addr.Size,
+		ExpiresAt: expiresAt,
+	}); err != nil {
+		return err
+	}
+	s.fanoutSet(key, string(data), expiresAt)
+	return nil
+}
+
+// GetBlobMeta returns the volume address and expiry for key without reading
+// the blob data.  Returns (BlobMeta{}, false) if the key is absent or expired.
+func (s *Session) GetBlobMeta(key string) (BlobMeta, bool) {
+	s.db.mu.RLock()
+	defer s.db.mu.RUnlock()
+
+	addr, expiresAt, ok := s.db.hindex.Get(key)
+	if !ok {
+		return BlobMeta{}, false
+	}
+	if expiresAt > 0 && time.Now().After(time.Unix(0, expiresAt)) {
+		return BlobMeta{}, false
+	}
+	return BlobMeta{Addr: addr, ExpiresAt: expiresAt}, true
+}
+
+// ReadBlobAt reads Size bytes from addr, returning a sub-slice [start, start+length).
+// Used by the HTTP blob server to serve Range requests without loading the full blob.
+// start and length are clamped to the actual data bounds.
+func (s *Session) ReadBlobAt(addr NeedleAddr, start, length int64) ([]byte, error) {
+	data, err := s.db.volumes.Read(addr)
+	if err != nil {
+		return nil, err
+	}
+	n := int64(len(data))
+	if start >= n {
+		return []byte{}, nil
+	}
+	end := start + length
+	if end > n || length < 0 {
+		end = n
+	}
+	return data[start:end], nil
+}
+
 // Delete removes key from the store.
 func (s *Session) Delete(key string) error {
 	s.db.mu.Lock()
