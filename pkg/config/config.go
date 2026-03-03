@@ -11,15 +11,15 @@ import (
 
 // Config holds all server settings.
 type Config struct {
-	Addr string `json:"addr"` // TCP listen address (default ":6380")
-	WAL  string `json:"wal"`  // WAL file path     (default "wal.log")
+	Addr    string `json:"addr"`     // TCP listen address (default ":6380")
+	DataDir string `json:"data_dir"` // database directory (default "brisedb-data")
 }
 
 // defaults returns a Config pre-filled with default values.
 func defaults() Config {
 	return Config{
-		Addr: ":6380",
-		WAL:  "wal.log",
+		Addr:    ":6380",
+		DataDir: "brisedb-data",
 	}
 }
 
@@ -49,12 +49,11 @@ func Load(path string, explicit bool) (Config, error) {
 }
 
 // Apply overlays non-zero flag values on top of cfg.
-// A flag value is considered "set" when it differs from its zero string.
-func (c *Config) Apply(addr, wal string) {
+func (c *Config) Apply(addr, dataDir string) {
 	if addr != "" {
 		c.Addr = addr
 	}
-	if wal != "" {
-		c.WAL = wal
+	if dataDir != "" {
+		c.DataDir = dataDir
 	}
 }

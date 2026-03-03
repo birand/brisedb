@@ -12,7 +12,7 @@ import (
 
 func startPrimary(t *testing.T) (string, *brisedb.BriseDB) {
 	t.Helper()
-	db, err := brisedb.NewBriseDB(t.TempDir() + "/primary.wal")
+	db, err := brisedb.NewBriseDB(t.TempDir())
 	if err != nil {
 		t.Fatalf("primary NewBriseDB: %v", err)
 	}
@@ -27,7 +27,7 @@ func startPrimary(t *testing.T) (string, *brisedb.BriseDB) {
 
 func startReplica(t *testing.T, primaryAddr string) string {
 	t.Helper()
-	db, err := brisedb.NewBriseDB(t.TempDir() + "/replica.wal")
+	db, err := brisedb.NewBriseDB(t.TempDir())
 	if err != nil {
 		t.Fatalf("replica NewBriseDB: %v", err)
 	}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 )
@@ -13,47 +14,67 @@ import (
 type Map = map[string]string
 
 // walEntry is the on-disk format for WAL records.
+// Value is never written to the WAL file; it is only populated when entries
+// are sent over the replication stream (snapshot + live fanout).
 type walEntry struct {
 	Type      string
 	Key       string
-	Value     string `json:",omitempty"`
+	Value     string `json:",omitempty"` // replication only
+	VolumeID  uint32 `json:",omitempty"`
+	Offset    uint64 `json:",omitempty"`
+	Size      uint64 `json:",omitempty"`
 	ExpiresAt int64  `json:",omitempty"` // Unix seconds; 0 = no expiry
 }
 
-// BriseDB encapsulates the shared database state (store, WAL). Thread-safe.
-// Transaction state lives in Session — one per connection/client.
+// BriseDB encapsulates shared database state. Thread-safe.
+// Transaction state lives in Session — one per connection.
 type BriseDB struct {
 	mu          sync.RWMutex
-	store       map[string]string
-	valueCounts map[string]int
-	expiry      map[string]time.Time // keys with a TTL
+	index       map[string]NeedleAddr // key → location in a volume file
+	expiry      map[string]time.Time  // keys with a TTL
 	pubsub      *PubSub
 	replication *replicationManager
+	volumes     *VolumeManager
 	walFile     *os.File
 	walPath     string
 	stopCh      chan struct{}
 }
 
-// NewBriseDB creates a new BriseDB instance. walPath is the path to the WAL file.
-func NewBriseDB(walPath string) (*BriseDB, error) {
+// NewBriseDB opens (or creates) the database at dataDir.
+// The WAL is stored at dataDir/wal.log; volume files at dataDir/volumes/.
+func NewBriseDB(dataDir string) (*BriseDB, error) {
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		return nil, fmt.Errorf("create data dir: %w", err)
+	}
+
+	walPath := filepath.Join(dataDir, "wal.log")
 	walFile, err := os.OpenFile(walPath, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open WAL file: %w", err)
+		return nil, fmt.Errorf("open WAL: %w", err)
+	}
+
+	volDir := filepath.Join(dataDir, "volumes")
+	volumes, err := newVolumeManager(volDir)
+	if err != nil {
+		walFile.Close()
+		return nil, fmt.Errorf("open volumes: %w", err)
 	}
 
 	db := &BriseDB{
-		store:       make(map[string]string),
-		valueCounts: make(map[string]int),
+		index:       make(map[string]NeedleAddr),
 		expiry:      make(map[string]time.Time),
 		pubsub:      newPubSub(),
 		replication: newReplicationManager(),
+		volumes:     volumes,
 		walFile:     walFile,
 		walPath:     walPath,
 		stopCh:      make(chan struct{}),
 	}
 
 	if err := db.replayWAL(); err != nil {
-		return nil, fmt.Errorf("failed to replay WAL: %w", err)
+		walFile.Close()
+		volumes.Close()
+		return nil, fmt.Errorf("replay WAL: %w", err)
 	}
 
 	go db.evictionLoop()
@@ -72,9 +93,10 @@ func (db *BriseDB) NewSession() *Session {
 	}
 }
 
-// Close stops the eviction goroutine and closes the WAL file.
+// Close stops background goroutines and closes all files.
 func (db *BriseDB) Close() error {
 	close(db.stopCh)
+	db.volumes.Close()
 	return db.walFile.Close()
 }
 
@@ -92,49 +114,41 @@ func (db *BriseDB) evictionLoop() {
 	}
 }
 
-// evictExpired deletes all keys whose TTL has elapsed.
 func (db *BriseDB) evictExpired() {
 	now := time.Now()
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	for key, exp := range db.expiry {
 		if now.After(exp) {
-			if oldVal, ok := db.store[key]; ok {
-				db.valueCounts[oldVal]--
-				delete(db.store, key)
-			}
+			delete(db.index, key)
 			delete(db.expiry, key)
 		}
 	}
 }
 
-// replayWAL replays the operations from the WAL file.
-// Entries whose ExpiresAt is in the past are skipped.
+// replayWAL rebuilds the in-memory index from the WAL file.
+// Expired SET entries are skipped.
 func (db *BriseDB) replayWAL() error {
 	if _, err := db.walFile.Seek(0, 0); err != nil {
-		return fmt.Errorf("failed to seek to the beginning of the WAL file: %w", err)
+		return fmt.Errorf("seek WAL: %w", err)
 	}
-
 	now := time.Now()
 	scanner := bufio.NewScanner(db.walFile)
 	for scanner.Scan() {
 		var op walEntry
 		if err := json.Unmarshal(scanner.Bytes(), &op); err != nil {
-			return fmt.Errorf("failed to unmarshal WAL entry: %w", err)
+			return fmt.Errorf("unmarshal WAL entry: %w", err)
 		}
-
-		// Skip SET entries that have already expired
 		if op.Type == "SET" && op.ExpiresAt > 0 && time.Unix(op.ExpiresAt, 0).Before(now) {
 			continue
 		}
 		db.applyEntry(op)
 	}
-
 	return scanner.Err()
 }
 
-// Compact rewrites the WAL with only the current committed state, discarding
-// history and already-expired keys.
+// Compact rewrites the WAL with only live keys, discarding history and
+// already-expired entries. Volume files are not compacted (Phase 1).
 func (db *BriseDB) Compact() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -142,142 +156,179 @@ func (db *BriseDB) Compact() error {
 	now := time.Now()
 	f, err := os.OpenFile(db.walPath, os.O_TRUNC|os.O_WRONLY, 0644)
 	if err != nil {
-		return fmt.Errorf("failed to truncate WAL: %w", err)
+		return fmt.Errorf("truncate WAL: %w", err)
 	}
-
 	w := bufio.NewWriter(f)
-	for key, value := range db.store {
-		// Skip keys that have expired but not yet been evicted
+	for key, addr := range db.index {
 		if exp, ok := db.expiry[key]; ok && now.After(exp) {
 			continue
 		}
-		op := walEntry{Type: "SET", Key: key, Value: value}
+		op := walEntry{
+			Type:     "SET",
+			Key:      key,
+			VolumeID: addr.VolumeID,
+			Offset:   addr.Offset,
+			Size:     addr.Size,
+		}
 		if exp, ok := db.expiry[key]; ok {
 			op.ExpiresAt = exp.Unix()
 		}
 		data, err := json.Marshal(op)
 		if err != nil {
 			f.Close()
-			return fmt.Errorf("failed to marshal WAL entry: %w", err)
+			return fmt.Errorf("marshal WAL entry: %w", err)
 		}
 		if _, err := w.Write(append(data, '\n')); err != nil {
 			f.Close()
-			return fmt.Errorf("failed to write WAL entry: %w", err)
+			return fmt.Errorf("write WAL entry: %w", err)
 		}
 	}
-
 	if err := w.Flush(); err != nil {
 		f.Close()
-		return fmt.Errorf("failed to flush WAL: %w", err)
+		return fmt.Errorf("flush WAL: %w", err)
 	}
 	f.Close()
 
-	// Reopen in append mode so subsequent writes work correctly
 	db.walFile.Close()
 	db.walFile, err = os.OpenFile(db.walPath, os.O_APPEND|os.O_RDWR, 0644)
 	if err != nil {
-		return fmt.Errorf("failed to reopen WAL after compact: %w", err)
+		return fmt.Errorf("reopen WAL after compact: %w", err)
 	}
-
 	return nil
 }
 
-// writeWAL appends a walEntry to the WAL file and fans it out to replicas.
+// writeWAL appends a walEntry to the WAL file.
+// Value is stripped before writing — the WAL only stores needle addresses.
 // Must be called with mu held.
 func (db *BriseDB) writeWAL(op walEntry) error {
+	op.Value = "" // never persist value in WAL
 	data, err := json.Marshal(op)
 	if err != nil {
-		return fmt.Errorf("failed to marshal WAL entry: %w", err)
+		return fmt.Errorf("marshal WAL entry: %w", err)
 	}
-	line := append(data, '\n')
-	if _, err := db.walFile.Write(line); err != nil {
-		return fmt.Errorf("failed to write to WAL file: %w", err)
+	if _, err := db.walFile.Write(append(data, '\n')); err != nil {
+		return fmt.Errorf("write WAL: %w", err)
 	}
-	db.replication.fanout(data) // non-blocking; slow replicas drop entries
 	return nil
 }
 
-// applyEntry applies a single WAL entry to the in-memory store.
-// Must be called with mu held.
+// applyEntry applies a single WAL entry to the in-memory index.
+// Must be called with mu held (or during single-threaded replay).
 func (db *BriseDB) applyEntry(op walEntry) {
 	switch op.Type {
 	case "SET":
-		if oldValue, ok := db.store[op.Key]; ok {
-			db.valueCounts[oldValue]--
+		db.index[op.Key] = NeedleAddr{
+			VolumeID: op.VolumeID,
+			Offset:   op.Offset,
+			Size:     op.Size,
 		}
-		db.store[op.Key] = op.Value
-		db.valueCounts[op.Value]++
 		if op.ExpiresAt > 0 {
 			db.expiry[op.Key] = time.Unix(op.ExpiresAt, 0)
 		} else {
 			delete(db.expiry, op.Key)
 		}
+		// Ensure volume is registered for subsequent reads
+		db.volumes.EnsureVolume(op.VolumeID) //nolint:errcheck
 	case "DELETE":
-		if oldValue, ok := db.store[op.Key]; ok {
-			db.valueCounts[oldValue]--
-		}
-		delete(db.store, op.Key)
+		delete(db.index, op.Key)
 		delete(db.expiry, op.Key)
 	}
 }
 
-// Snapshot returns all current WAL entries as JSON lines (without newlines).
-// It is called by the replication handler to send an initial state to a new replica.
+// Snapshot returns all live keys as JSON walEntry lines (with Value populated)
+// for sending to a new replica. Reads value bytes from volume files.
 func (db *BriseDB) Snapshot() [][]byte {
 	now := time.Now()
-	db.mu.RLock()
-	defer db.mu.RUnlock()
 
-	entries := make([][]byte, 0, len(db.store))
-	for key, value := range db.store {
-		if exp, ok := db.expiry[key]; ok && now.After(exp) {
+	// Collect index under read lock
+	type snap struct {
+		key       string
+		addr      NeedleAddr
+		expiresAt int64
+	}
+	db.mu.RLock()
+	snaps := make([]snap, 0, len(db.index))
+	for k, addr := range db.index {
+		if exp, ok := db.expiry[k]; ok {
+			if now.After(exp) {
+				continue
+			}
+			snaps = append(snaps, snap{k, addr, exp.Unix()})
+		} else {
+			snaps = append(snaps, snap{k, addr, 0})
+		}
+	}
+	db.mu.RUnlock()
+
+	// Read values from volumes (no lock held)
+	result := make([][]byte, 0, len(snaps))
+	for _, s := range snaps {
+		data, err := db.volumes.Read(s.addr)
+		if err != nil {
 			continue
 		}
-		op := walEntry{Type: "SET", Key: key, Value: value}
-		if exp, ok := db.expiry[key]; ok {
-			op.ExpiresAt = exp.Unix()
+		op := walEntry{
+			Type:      "SET",
+			Key:       s.key,
+			Value:     string(data),
+			ExpiresAt: s.expiresAt,
 		}
-		data, _ := json.Marshal(op)
-		entries = append(entries, data)
+		b, _ := json.Marshal(op)
+		result = append(result, b)
 	}
-	return entries
+	return result
 }
 
-// ApplyReplicationEntry decodes a WAL JSON line and applies it to the store.
-// Used by replica instances to consume entries streamed from the primary.
+// ApplyReplicationEntry decodes a replication entry (which carries Value),
+// writes the value to the local volume, updates the index, and writes the WAL.
 func (db *BriseDB) ApplyReplicationEntry(data []byte) error {
 	var op walEntry
 	if err := json.Unmarshal(data, &op); err != nil {
 		return fmt.Errorf("replication: bad entry: %w", err)
 	}
+
+	if op.Type == "SET" {
+		addr, err := db.volumes.Write([]byte(op.Value))
+		if err != nil {
+			return fmt.Errorf("replication: write volume: %w", err)
+		}
+		op.VolumeID = addr.VolumeID
+		op.Offset = addr.Offset
+		op.Size = addr.Size
+	}
+
 	db.mu.Lock()
 	db.applyEntry(op)
+	err := db.writeWAL(op)
 	db.mu.Unlock()
-	return nil
+	return err
 }
 
 // Replication returns the replication manager (used by the server handler).
 func (db *BriseDB) Replication() *replicationManager { return db.replication }
 
-// Transaction points to a key:value storage
+// ------------------------------------------------------------------ //
+// Transaction types
+// ------------------------------------------------------------------ //
+
+// Transaction holds in-flight key-value changes for one savepoint.
 type Transaction struct {
 	store   map[string]string
 	deleted map[string]bool
 	// expiry tracks TTL changes within this transaction:
 	//   zero time  → clear expiry on commit (Set / Persist)
 	//   non-zero   → set expiry on commit (SetEX)
-	//   key absent → no change to expiry on commit
+	//   key absent → no change on commit
 	expiry map[string]time.Time
 	next   *Transaction
 }
 
-// TransactionStack maintains a list of active/suspended transactions
+// TransactionStack is a linked-list stack of active transactions.
 type TransactionStack struct {
 	top  *Transaction
 	size int
 }
 
-// PushTransaction creates a new active transaction
 func (ts *TransactionStack) PushTransaction() {
 	temp := Transaction{
 		store:   make(Map),
@@ -289,7 +340,6 @@ func (ts *TransactionStack) PushTransaction() {
 	ts.size++
 }
 
-// PopTransaction deletes a transaction from the stack
 func (ts *TransactionStack) PopTransaction() error {
 	if ts.top == nil {
 		return fmt.Errorf("ERROR: No Active Transactions")
@@ -299,7 +349,6 @@ func (ts *TransactionStack) PopTransaction() error {
 	return nil
 }
 
-// Peek returns the active transaction
 func (ts *TransactionStack) Peek() *Transaction {
 	return ts.top
 }

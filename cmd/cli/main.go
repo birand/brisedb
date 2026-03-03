@@ -13,7 +13,7 @@ import (
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 
-	db, err := brisedb.NewBriseDB("wal.log")
+	db, err := brisedb.NewBriseDB("brisedb-data")
 	if err != nil {
 		logger.Error("failed to create database", "error", err)
 		os.Exit(1)

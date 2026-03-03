@@ -14,7 +14,7 @@ import (
 // Shutdown is registered via t.Cleanup so it runs after test defers.
 func startServer(t *testing.T) string {
 	t.Helper()
-	db, err := brisedb.NewBriseDB(t.TempDir() + "/wal.log")
+	db, err := brisedb.NewBriseDB(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewBriseDB: %v", err)
 	}

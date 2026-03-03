@@ -1,6 +1,7 @@
 package brisedb
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
 	"time"
@@ -23,13 +24,14 @@ func (s *Session) BeginTransaction() {
 func (s *Session) CommitTransaction() error {
 	s.db.mu.Lock()
 	defer s.db.mu.Unlock()
+
 	active := s.transactions.Peek()
 	if active == nil {
 		return fmt.Errorf("INFO: Nothing to commit")
 	}
 
 	if active.next != nil {
-		// Merge into parent transaction
+		// Merge into parent transaction (no disk I/O)
 		for key, value := range active.store {
 			delete(active.next.deleted, key)
 			active.next.store[key] = value
@@ -44,38 +46,46 @@ func (s *Session) CommitTransaction() error {
 	} else {
 		// Merge into main store
 		for key, value := range active.store {
-			if oldValue, ok := s.db.store[key]; ok {
-				s.db.valueCounts[oldValue]--
+			// Write value to volume
+			addr, err := s.db.volumes.Write([]byte(value))
+			if err != nil {
+				return fmt.Errorf("commit: write volume: %w", err)
 			}
-			s.db.store[key] = value
-			s.db.valueCounts[value]++
+			s.db.index[key] = addr
 
-			// Apply expiry change for this key
-			op := walEntry{Type: "SET", Key: key, Value: value}
+			var expiresAt int64
 			if exp, ok := active.expiry[key]; ok {
 				if exp.IsZero() {
 					delete(s.db.expiry, key)
 				} else {
 					s.db.expiry[key] = exp
-					op.ExpiresAt = exp.Unix()
+					expiresAt = exp.Unix()
 				}
 			} else {
-				// No expiry change — clear any existing expiry (plain Set)
 				delete(s.db.expiry, key)
 			}
 
-			if err := s.db.writeWAL(op); err != nil {
+			walOp := walEntry{
+				Type:      "SET",
+				Key:       key,
+				VolumeID:  addr.VolumeID,
+				Offset:    addr.Offset,
+				Size:      addr.Size,
+				ExpiresAt: expiresAt,
+			}
+			if err := s.db.writeWAL(walOp); err != nil {
 				return err
 			}
+			s.fanoutSet(key, value, expiresAt)
 		}
 
 		for key := range active.deleted {
-			if oldValue, ok := s.db.store[key]; ok {
-				s.db.valueCounts[oldValue]--
-				delete(s.db.store, key)
+			if _, ok := s.db.index[key]; ok {
+				delete(s.db.index, key)
 				if err := s.db.writeWAL(walEntry{Type: "DELETE", Key: key}); err != nil {
 					return err
 				}
+				s.fanoutDelete(key)
 			}
 			delete(s.db.expiry, key)
 		}
@@ -92,11 +102,12 @@ func (s *Session) RollbackTransaction() error {
 }
 
 // Get returns the value of key, checking the transaction stack before the main store.
-// Keys that have expired are treated as absent.
+// Expired keys are treated as absent.
 func (s *Session) Get(key string) (string, bool) {
 	s.db.mu.RLock()
 	defer s.db.mu.RUnlock()
 
+	// Check transaction stack first (in-memory, no disk I/O)
 	tx := s.transactions.Peek()
 	for tx != nil {
 		if tx.deleted[key] {
@@ -108,18 +119,26 @@ func (s *Session) Get(key string) (string, bool) {
 		tx = tx.next
 	}
 
-	// Lazy expiry check on committed store
+	// Lazy expiry check
 	if exp, ok := s.db.expiry[key]; ok && time.Now().After(exp) {
 		return "", false
 	}
-	if val, ok := s.db.store[key]; ok {
-		return val, true
+
+	addr, ok := s.db.index[key]
+	if !ok {
+		return "", false
 	}
-	return "", false
+
+	// Read value from volume (RLock held; fine for Phase 1)
+	data, err := s.db.volumes.Read(addr)
+	if err != nil {
+		return "", false
+	}
+	return string(data), true
 }
 
 // Set assigns value to key, clearing any existing TTL.
-func (s *Session) Set(key string, value string) error {
+func (s *Session) Set(key, value string) error {
 	s.db.mu.Lock()
 	defer s.db.mu.Unlock()
 
@@ -131,17 +150,27 @@ func (s *Session) Set(key string, value string) error {
 		return nil
 	}
 
-	if oldValue, ok := s.db.store[key]; ok {
-		s.db.valueCounts[oldValue]--
+	addr, err := s.db.volumes.Write([]byte(value))
+	if err != nil {
+		return fmt.Errorf("set: write volume: %w", err)
 	}
-	s.db.store[key] = value
-	s.db.valueCounts[value]++
+	s.db.index[key] = addr
 	delete(s.db.expiry, key)
 
-	return s.db.writeWAL(walEntry{Type: "SET", Key: key, Value: value})
+	if err := s.db.writeWAL(walEntry{
+		Type:     "SET",
+		Key:      key,
+		VolumeID: addr.VolumeID,
+		Offset:   addr.Offset,
+		Size:     addr.Size,
+	}); err != nil {
+		return err
+	}
+	s.fanoutSet(key, value, 0)
+	return nil
 }
 
-// SetEX assigns value to key with a TTL. The key is deleted after ttl elapses.
+// SetEX assigns value to key with a TTL.
 func (s *Session) SetEX(key, value string, ttl time.Duration) error {
 	if ttl <= 0 {
 		return fmt.Errorf("TTL must be positive")
@@ -159,77 +188,25 @@ func (s *Session) SetEX(key, value string, ttl time.Duration) error {
 		return nil
 	}
 
-	if oldValue, ok := s.db.store[key]; ok {
-		s.db.valueCounts[oldValue]--
+	addr, err := s.db.volumes.Write([]byte(value))
+	if err != nil {
+		return fmt.Errorf("setex: write volume: %w", err)
 	}
-	s.db.store[key] = value
-	s.db.valueCounts[value]++
+	s.db.index[key] = addr
 	s.db.expiry[key] = exp
 
-	return s.db.writeWAL(walEntry{Type: "SET", Key: key, Value: value, ExpiresAt: exp.Unix()})
-}
-
-// TTL returns the remaining lifetime of key in seconds.
-// Returns -1 if the key exists but has no expiry.
-// Returns -2 if the key does not exist or has already expired.
-func (s *Session) TTL(key string) int64 {
-	s.db.mu.RLock()
-	defer s.db.mu.RUnlock()
-
-	// Check transaction stack first
-	tx := s.transactions.Peek()
-	for tx != nil {
-		if tx.deleted[key] {
-			return -2
-		}
-		if _, ok := tx.store[key]; ok {
-			if exp, hasExp := tx.expiry[key]; hasExp && !exp.IsZero() {
-				rem := time.Until(exp)
-				if rem <= 0 {
-					return -2
-				}
-				return int64(rem.Seconds())
-			}
-			// Key set in tx without TTL — check committed expiry
-			// (it will be cleared on commit, so report no expiry)
-			return -1
-		}
-		tx = tx.next
+	if err := s.db.writeWAL(walEntry{
+		Type:      "SET",
+		Key:       key,
+		VolumeID:  addr.VolumeID,
+		Offset:    addr.Offset,
+		Size:      addr.Size,
+		ExpiresAt: exp.Unix(),
+	}); err != nil {
+		return err
 	}
-
-	// Committed store
-	if exp, ok := s.db.expiry[key]; ok {
-		rem := time.Until(exp)
-		if rem <= 0 {
-			return -2 // expired but not yet evicted
-		}
-		return int64(rem.Seconds())
-	}
-	if _, ok := s.db.store[key]; ok {
-		return -1
-	}
-	return -2
-}
-
-// Persist removes the TTL from key, making it persist indefinitely.
-// Returns true if the key existed and had a TTL, false otherwise.
-func (s *Session) Persist(key string) bool {
-	s.db.mu.Lock()
-	defer s.db.mu.Unlock()
-
-	active := s.transactions.Peek()
-	if active != nil {
-		if _, ok := active.store[key]; ok {
-			active.expiry[key] = time.Time{} // zero = clear expiry on commit
-			return true
-		}
-	}
-
-	if _, ok := s.db.expiry[key]; ok {
-		delete(s.db.expiry, key)
-		return true
-	}
-	return false
+	s.fanoutSet(key, value, exp.Unix())
+	return nil
 }
 
 // Delete removes key from the store.
@@ -245,73 +222,141 @@ func (s *Session) Delete(key string) error {
 		return nil
 	}
 
-	if oldValue, ok := s.db.store[key]; ok {
-		s.db.valueCounts[oldValue]--
+	if _, ok := s.db.index[key]; !ok {
+		return nil // key doesn't exist; nothing to do
 	}
-	delete(s.db.store, key)
+	delete(s.db.index, key)
 	delete(s.db.expiry, key)
 
-	return s.db.writeWAL(walEntry{Type: "DELETE", Key: key})
+	if err := s.db.writeWAL(walEntry{Type: "DELETE", Key: key}); err != nil {
+		return err
+	}
+	s.fanoutDelete(key)
+	return nil
 }
 
-// Count returns the number of keys set to value, accounting for in-flight
-// transactions and skipping expired keys.
-func (s *Session) Count(value string) int {
+// TTL returns the remaining lifetime of key in seconds.
+// Returns -1 if the key exists but has no expiry.
+// Returns -2 if the key does not exist or has already expired.
+func (s *Session) TTL(key string) int64 {
 	s.db.mu.RLock()
 	defer s.db.mu.RUnlock()
 
-	now := time.Now()
-
-	// Collect all keys touched by any transaction
-	touchedKeys := make(map[string]bool)
-	for tx := s.transactions.Peek(); tx != nil; tx = tx.next {
-		for k := range tx.store {
-			touchedKeys[k] = true
+	tx := s.transactions.Peek()
+	for tx != nil {
+		if tx.deleted[key] {
+			return -2
 		}
-		for k := range tx.deleted {
-			touchedKeys[k] = true
+		if _, ok := tx.store[key]; ok {
+			if exp, hasExp := tx.expiry[key]; hasExp && !exp.IsZero() {
+				rem := time.Until(exp)
+				if rem <= 0 {
+					return -2
+				}
+				return int64(rem.Seconds())
+			}
+			return -1
+		}
+		tx = tx.next
+	}
+
+	if exp, ok := s.db.expiry[key]; ok {
+		rem := time.Until(exp)
+		if rem <= 0 {
+			return -2
+		}
+		return int64(rem.Seconds())
+	}
+	if _, ok := s.db.index[key]; ok {
+		return -1
+	}
+	return -2
+}
+
+// Persist removes the TTL from key.
+// Returns true if the key existed and had a TTL.
+func (s *Session) Persist(key string) bool {
+	s.db.mu.Lock()
+	defer s.db.mu.Unlock()
+
+	active := s.transactions.Peek()
+	if active != nil {
+		if _, ok := active.store[key]; ok {
+			active.expiry[key] = time.Time{}
+			return true
 		}
 	}
 
-	if len(touchedKeys) == 0 {
-		// No active transaction — use valueCounts but subtract expired keys
-		count := s.db.valueCounts[value]
-		for key, exp := range s.db.expiry {
-			if now.After(exp) {
-				if s.db.store[key] == value {
-					count--
+	if _, ok := s.db.expiry[key]; ok {
+		delete(s.db.expiry, key)
+		return true
+	}
+	return false
+}
+
+// Count returns the number of keys whose value equals value.
+// This performs a full index scan with a disk read per key — O(n).
+func (s *Session) Count(value string) int {
+	now := time.Now()
+
+	// Snapshot the index and transaction state under read lock
+	type entry struct {
+		key       string
+		addr      NeedleAddr
+		exp       time.Time
+		hasExp    bool
+	}
+	s.db.mu.RLock()
+	entries := make([]entry, 0, len(s.db.index))
+	for k, addr := range s.db.index {
+		exp, hasExp := s.db.expiry[k]
+		entries = append(entries, entry{k, addr, exp, hasExp})
+	}
+	// Snapshot tx overrides
+	txOverride := make(map[string]string) // key → effective value ("" + deleted=true means deleted)
+	txDeleted := make(map[string]bool)
+	for tx := s.transactions.Peek(); tx != nil; tx = tx.next {
+		for k, v := range tx.store {
+			if _, seen := txOverride[k]; !seen {
+				if !txDeleted[k] {
+					txOverride[k] = v
 				}
 			}
 		}
-		return count
-	}
-
-	count := s.db.valueCounts[value]
-
-	// Subtract expired keys from the base count
-	for key, exp := range s.db.expiry {
-		if now.After(exp) && !touchedKeys[key] {
-			if s.db.store[key] == value {
-				count--
+		for k := range tx.deleted {
+			if _, seen := txOverride[k]; !seen {
+				txDeleted[k] = true
 			}
 		}
 	}
+	s.db.mu.RUnlock()
 
-	for key := range touchedKeys {
-		committedVal, committedExists := s.db.store[key]
-		// A committed key that has expired counts as absent
-		if committedExists {
-			if exp, ok := s.db.expiry[key]; ok && now.After(exp) {
-				committedExists = false
-			}
+	count := 0
+
+	// Count from committed index (disk reads, no lock held)
+	for _, e := range entries {
+		if txDeleted[e.key] {
+			continue
 		}
-
-		txVal, txExists := s.effectiveTransactionValue(key)
-
-		if committedExists && committedVal == value {
-			count--
+		if _, overridden := txOverride[e.key]; overridden {
+			continue
 		}
-		if txExists && txVal == value {
+		if e.hasExp && now.After(e.exp) {
+			continue
+		}
+		data, err := s.db.volumes.Read(e.addr)
+		if err != nil {
+			continue
+		}
+		if string(data) == value {
+			count++
+		}
+	}
+
+	// Count from in-flight transaction writes
+	for k, v := range txOverride {
+		_ = k
+		if v == value {
 			count++
 		}
 	}
@@ -319,30 +364,16 @@ func (s *Session) Count(value string) int {
 	return count
 }
 
-// effectiveTransactionValue returns the effective value for key from the transaction stack.
-// Must be called with at least db.mu.RLock held.
-func (s *Session) effectiveTransactionValue(key string) (string, bool) {
-	for tx := s.transactions.Peek(); tx != nil; tx = tx.next {
-		if tx.deleted[key] {
-			return "", false
-		}
-		if val, ok := tx.store[key]; ok {
-			return val, true
-		}
-	}
-	return "", false
-}
-
-// Keys returns all committed keys whose names match pattern.
-// Pattern supports glob wildcards: * (any sequence), ? (any single char).
-// Expired keys are excluded. Results are sorted alphabetically.
+// Keys returns all committed keys matching pattern, excluding expired keys.
+// Pattern supports * (any sequence) and ? (any single char).
+// Results are sorted alphabetically.
 func (s *Session) Keys(pattern string) ([]string, error) {
 	s.db.mu.RLock()
 	defer s.db.mu.RUnlock()
 
 	now := time.Now()
 	var result []string
-	for key := range s.db.store {
+	for key := range s.db.index {
 		if exp, ok := s.db.expiry[key]; ok && now.After(exp) {
 			continue
 		}
@@ -359,9 +390,7 @@ func (s *Session) Keys(pattern string) ([]string, error) {
 }
 
 // Scan returns a paginated batch of committed keys starting at cursor.
-// count is a hint for the batch size; the actual count may be smaller.
 // When the returned nextCursor is 0, iteration is complete.
-// Keys are iterated in alphabetical order. Expired keys are excluded.
 func (s *Session) Scan(cursor, count int) (nextCursor int, keys []string) {
 	if count <= 0 {
 		count = 10
@@ -370,8 +399,8 @@ func (s *Session) Scan(cursor, count int) (nextCursor int, keys []string) {
 	defer s.db.mu.RUnlock()
 
 	now := time.Now()
-	all := make([]string, 0, len(s.db.store))
-	for key := range s.db.store {
+	all := make([]string, 0, len(s.db.index))
+	for key := range s.db.index {
 		if exp, ok := s.db.expiry[key]; ok && now.After(exp) {
 			continue
 		}
@@ -389,8 +418,41 @@ func (s *Session) Scan(cursor, count int) (nextCursor int, keys []string) {
 	return end, all[cursor:end]
 }
 
-// globMatch reports whether key matches the glob pattern.
-// * matches any sequence of characters (including /), ? matches any single character.
+// ------------------------------------------------------------------ //
+// Replication helpers (called with mu held)
+// ------------------------------------------------------------------ //
+
+// fanoutSet sends a SET entry (with value) to connected replicas.
+func (s *Session) fanoutSet(key, value string, expiresAt int64) {
+	op := walEntry{Type: "SET", Key: key, Value: value, ExpiresAt: expiresAt}
+	data, _ := json.Marshal(op)
+	s.db.replication.fanout(data)
+}
+
+// fanoutDelete sends a DELETE entry to connected replicas.
+func (s *Session) fanoutDelete(key string) {
+	op := walEntry{Type: "DELETE", Key: key}
+	data, _ := json.Marshal(op)
+	s.db.replication.fanout(data)
+}
+
+// effectiveTransactionValue returns the effective value for key from the tx stack.
+func (s *Session) effectiveTransactionValue(key string) (string, bool) {
+	for tx := s.transactions.Peek(); tx != nil; tx = tx.next {
+		if tx.deleted[key] {
+			return "", false
+		}
+		if val, ok := tx.store[key]; ok {
+			return val, true
+		}
+	}
+	return "", false
+}
+
+// ------------------------------------------------------------------ //
+// Glob matching
+// ------------------------------------------------------------------ //
+
 func globMatch(pattern, key string) (bool, error) {
 	return matchGlob(pattern, key), nil
 }
@@ -399,7 +461,6 @@ func matchGlob(p, s string) bool {
 	for len(p) > 0 {
 		switch p[0] {
 		case '*':
-			// skip consecutive stars
 			for len(p) > 0 && p[0] == '*' {
 				p = p[1:]
 			}

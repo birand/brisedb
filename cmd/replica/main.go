@@ -17,12 +17,12 @@ import (
 func main() {
 	primary := flag.String("primary", "localhost:6380", "address of the primary brisedb server")
 	addr := flag.String("addr", ":6381", "TCP address for this replica to listen on")
-	walPath := flag.String("wal", "replica.wal", "path to replica WAL file")
+	dataDir := flag.String("data", "replica-data", "replica database directory")
 	flag.Parse()
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 
-	db, err := brisedb.NewBriseDB(*walPath)
+	db, err := brisedb.NewBriseDB(*dataDir)
 	if err != nil {
 		logger.Error("failed to open replica database", "error", err)
 		os.Exit(1)

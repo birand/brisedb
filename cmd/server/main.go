@@ -15,13 +15,11 @@ import (
 func main() {
 	configPath := flag.String("config", "", "path to JSON config file (optional)")
 	addr := flag.String("addr", "", "TCP address to listen on (overrides config)")
-	walPath := flag.String("wal", "", "path to WAL file (overrides config)")
+	dataDir := flag.String("data", "", "database directory (overrides config)")
 	flag.Parse()
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 
-	// Load config file; explicit=true when --config was provided so a missing
-	// file is treated as an error rather than silently ignored.
 	explicit := isFlagSet("config")
 	cfg, err := config.Load(*configPath, explicit)
 	if err != nil {
@@ -29,12 +27,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Flags override config values
-	cfg.Apply(*addr, *walPath)
+	cfg.Apply(*addr, *dataDir)
 
-	logger.Info("starting brisedb", "addr", cfg.Addr, "wal", cfg.WAL)
+	logger.Info("starting brisedb", "addr", cfg.Addr, "data", cfg.DataDir)
 
-	db, err := brisedb.NewBriseDB(cfg.WAL)
+	db, err := brisedb.NewBriseDB(cfg.DataDir)
 	if err != nil {
 		logger.Error("failed to open database", "error", err)
 		os.Exit(1)
@@ -48,7 +45,6 @@ func main() {
 
 	logger.Info("brisedb server listening", "addr", srv.Addr())
 
-	// Handle SIGINT/SIGTERM for graceful shutdown
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -67,8 +63,6 @@ func main() {
 	db.Close()
 }
 
-// isFlagSet reports whether the named flag was explicitly provided on the
-// command line.
 func isFlagSet(name string) bool {
 	found := false
 	flag.Visit(func(f *flag.Flag) {

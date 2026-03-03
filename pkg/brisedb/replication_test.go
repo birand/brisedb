@@ -66,7 +66,7 @@ func TestReplicationManager_SlowReplicaDrop(t *testing.T) {
 }
 
 func TestSnapshot(t *testing.T) {
-	walPath := t.TempDir() + "/wal.log"
+	walPath := t.TempDir()
 	db, err := NewBriseDB(walPath)
 	if err != nil {
 		t.Fatalf("NewBriseDB: %v", err)
@@ -86,8 +86,8 @@ func TestSnapshot(t *testing.T) {
 }
 
 func TestApplyReplicationEntry(t *testing.T) {
-	srcPath := t.TempDir() + "/src.wal"
-	dstPath := t.TempDir() + "/dst.wal"
+	srcPath := t.TempDir()
+	dstPath := t.TempDir()
 
 	src, err := NewBriseDB(srcPath)
 	if err != nil {

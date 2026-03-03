@@ -23,13 +23,13 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.Addr != ":6380" {
 		t.Errorf("default Addr: want :6380, got %q", cfg.Addr)
 	}
-	if cfg.WAL != "wal.log" {
-		t.Errorf("default WAL: want wal.log, got %q", cfg.WAL)
+	if cfg.DataDir != "brisedb-data" {
+		t.Errorf("default WAL: want brisedb-data, got %q", cfg.DataDir)
 	}
 }
 
 func TestLoad_FromFile(t *testing.T) {
-	p := writeConfig(t, `{"addr":":9999","wal":"/tmp/test.wal"}`)
+	p := writeConfig(t, `{"addr":":9999","data_dir":"/tmp/test.wal"}`)
 	cfg, err := Load(p, true)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -37,8 +37,8 @@ func TestLoad_FromFile(t *testing.T) {
 	if cfg.Addr != ":9999" {
 		t.Errorf("Addr: want :9999, got %q", cfg.Addr)
 	}
-	if cfg.WAL != "/tmp/test.wal" {
-		t.Errorf("WAL: want /tmp/test.wal, got %q", cfg.WAL)
+	if cfg.DataDir != "/tmp/test.wal" {
+		t.Errorf("WAL: want /tmp/test.wal, got %q", cfg.DataDir)
 	}
 }
 
@@ -52,8 +52,8 @@ func TestLoad_PartialFile_KeepsDefaults(t *testing.T) {
 	if cfg.Addr != ":7777" {
 		t.Errorf("Addr: want :7777, got %q", cfg.Addr)
 	}
-	if cfg.WAL != "wal.log" {
-		t.Errorf("WAL should be default, got %q", cfg.WAL)
+	if cfg.DataDir != "brisedb-data" {
+		t.Errorf("WAL should be default, got %q", cfg.DataDir)
 	}
 }
 
@@ -83,7 +83,7 @@ func TestLoad_InvalidJSON_ReturnsError(t *testing.T) {
 }
 
 func TestApply_FlagsOverrideConfig(t *testing.T) {
-	p := writeConfig(t, `{"addr":":9999","wal":"/config.wal"}`)
+	p := writeConfig(t, `{"addr":":9999","data_dir":"/config.wal"}`)
 	cfg, _ := Load(p, true)
 
 	cfg.Apply(":1111", "/flag.wal")
@@ -91,13 +91,13 @@ func TestApply_FlagsOverrideConfig(t *testing.T) {
 	if cfg.Addr != ":1111" {
 		t.Errorf("Addr: want :1111, got %q", cfg.Addr)
 	}
-	if cfg.WAL != "/flag.wal" {
-		t.Errorf("WAL: want /flag.wal, got %q", cfg.WAL)
+	if cfg.DataDir != "/flag.wal" {
+		t.Errorf("WAL: want /flag.wal, got %q", cfg.DataDir)
 	}
 }
 
 func TestApply_EmptyFlagsKeepConfig(t *testing.T) {
-	p := writeConfig(t, `{"addr":":9999","wal":"/config.wal"}`)
+	p := writeConfig(t, `{"addr":":9999","data_dir":"/config.wal"}`)
 	cfg, _ := Load(p, true)
 
 	cfg.Apply("", "")
@@ -105,7 +105,7 @@ func TestApply_EmptyFlagsKeepConfig(t *testing.T) {
 	if cfg.Addr != ":9999" {
 		t.Errorf("Addr should not change, got %q", cfg.Addr)
 	}
-	if cfg.WAL != "/config.wal" {
-		t.Errorf("WAL should not change, got %q", cfg.WAL)
+	if cfg.DataDir != "/config.wal" {
+		t.Errorf("WAL should not change, got %q", cfg.DataDir)
 	}
 }

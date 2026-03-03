@@ -7,9 +7,7 @@ import (
 )
 
 func setupTestDB(t *testing.T) (*BriseDB, *Session, func()) {
-	walPath := t.TempDir() + "/wal.log"
-
-	db, err := NewBriseDB(walPath)
+	db, err := NewBriseDB(t.TempDir())
 	if err != nil {
 		t.Fatalf("Failed to create BriseDB: %v", err)
 	}
@@ -17,7 +15,7 @@ func setupTestDB(t *testing.T) (*BriseDB, *Session, func()) {
 	session := db.NewSession()
 
 	return db, session, func() {
-		db.walFile.Close()
+		db.Close()
 	}
 }
 
@@ -122,20 +120,20 @@ func TestTransaction(t *testing.T) {
 }
 
 func TestPersistence(t *testing.T) {
-	walPath := t.TempDir() + "/wal.log"
+	dir := t.TempDir()
 
-	db, err := NewBriseDB(walPath)
+	db, err := NewBriseDB(dir)
 	if err != nil {
 		t.Fatalf("Failed to create BriseDB: %v", err)
 	}
 	db.NewSession().Set("persisted", "true")
-	db.walFile.Close()
+	db.Close()
 
-	db2, err := NewBriseDB(walPath)
+	db2, err := NewBriseDB(dir)
 	if err != nil {
 		t.Fatalf("Failed to create BriseDB: %v", err)
 	}
-	defer db2.walFile.Close()
+	defer db2.Close()
 
 	val, ok := db2.NewSession().Get("persisted")
 	if !ok || val != "true" {
@@ -373,9 +371,9 @@ func TestTTL_SetClearsTTL(t *testing.T) {
 }
 
 func TestTTL_WALPersistence(t *testing.T) {
-	walPath := t.TempDir() + "/wal.log"
+	dir := t.TempDir()
 
-	db, err := NewBriseDB(walPath)
+	db, err := NewBriseDB(dir)
 	if err != nil {
 		t.Fatalf("NewBriseDB: %v", err)
 	}
@@ -385,7 +383,7 @@ func TestTTL_WALPersistence(t *testing.T) {
 	time.Sleep(10 * time.Millisecond)
 	db.Close()
 
-	db2, err := NewBriseDB(walPath)
+	db2, err := NewBriseDB(dir)
 	if err != nil {
 		t.Fatalf("NewBriseDB reload: %v", err)
 	}
