@@ -46,12 +46,10 @@ func (s *Session) CommitTransaction() error {
 	} else {
 		// Merge into main store
 		for key, value := range active.store {
-			// Write value to volume
 			addr, err := s.db.volumes.Write([]byte(value))
 			if err != nil {
 				return fmt.Errorf("commit: write volume: %w", err)
 			}
-			s.db.index[key] = addr
 
 			var expiresAt int64
 			if exp, ok := active.expiry[key]; ok {
@@ -59,10 +57,14 @@ func (s *Session) CommitTransaction() error {
 					delete(s.db.expiry, key)
 				} else {
 					s.db.expiry[key] = exp
-					expiresAt = exp.Unix()
+					expiresAt = exp.UnixNano()
 				}
 			} else {
 				delete(s.db.expiry, key)
+			}
+
+			if err := s.db.hindex.Set(key, addr, expiresAt); err != nil {
+				return fmt.Errorf("commit: update index: %w", err)
 			}
 
 			walOp := walEntry{
@@ -80,8 +82,10 @@ func (s *Session) CommitTransaction() error {
 		}
 
 		for key := range active.deleted {
-			if _, ok := s.db.index[key]; ok {
-				delete(s.db.index, key)
+			if _, _, ok := s.db.hindex.Get(key); ok {
+				if err := s.db.hindex.Delete(key); err != nil {
+					return fmt.Errorf("commit: delete index: %w", err)
+				}
 				if err := s.db.writeWAL(walEntry{Type: "DELETE", Key: key}); err != nil {
 					return err
 				}
@@ -119,17 +123,14 @@ func (s *Session) Get(key string) (string, bool) {
 		tx = tx.next
 	}
 
-	// Lazy expiry check
-	if exp, ok := s.db.expiry[key]; ok && time.Now().After(exp) {
-		return "", false
-	}
-
-	addr, ok := s.db.index[key]
+	addr, expiresAt, ok := s.db.hindex.Get(key)
 	if !ok {
 		return "", false
 	}
+	if expiresAt > 0 && time.Now().After(time.Unix(0, expiresAt)) {
+		return "", false
+	}
 
-	// Read value from volume (RLock held; fine for Phase 1)
 	data, err := s.db.volumes.Read(addr)
 	if err != nil {
 		return "", false
@@ -154,7 +155,9 @@ func (s *Session) Set(key, value string) error {
 	if err != nil {
 		return fmt.Errorf("set: write volume: %w", err)
 	}
-	s.db.index[key] = addr
+	if err := s.db.hindex.Set(key, addr, 0); err != nil {
+		return fmt.Errorf("set: update index: %w", err)
+	}
 	delete(s.db.expiry, key)
 
 	if err := s.db.writeWAL(walEntry{
@@ -192,7 +195,9 @@ func (s *Session) SetEX(key, value string, ttl time.Duration) error {
 	if err != nil {
 		return fmt.Errorf("setex: write volume: %w", err)
 	}
-	s.db.index[key] = addr
+	if err := s.db.hindex.Set(key, addr, exp.UnixNano()); err != nil {
+		return fmt.Errorf("setex: update index: %w", err)
+	}
 	s.db.expiry[key] = exp
 
 	if err := s.db.writeWAL(walEntry{
@@ -201,11 +206,11 @@ func (s *Session) SetEX(key, value string, ttl time.Duration) error {
 		VolumeID:  addr.VolumeID,
 		Offset:    addr.Offset,
 		Size:      addr.Size,
-		ExpiresAt: exp.Unix(),
+		ExpiresAt: exp.UnixNano(),
 	}); err != nil {
 		return err
 	}
-	s.fanoutSet(key, value, exp.Unix())
+	s.fanoutSet(key, value, exp.UnixNano())
 	return nil
 }
 
@@ -222,10 +227,12 @@ func (s *Session) Delete(key string) error {
 		return nil
 	}
 
-	if _, ok := s.db.index[key]; !ok {
+	if _, _, ok := s.db.hindex.Get(key); !ok {
 		return nil // key doesn't exist; nothing to do
 	}
-	delete(s.db.index, key)
+	if err := s.db.hindex.Delete(key); err != nil {
+		return fmt.Errorf("delete: update index: %w", err)
+	}
 	delete(s.db.expiry, key)
 
 	if err := s.db.writeWAL(walEntry{Type: "DELETE", Key: key}); err != nil {
@@ -260,17 +267,18 @@ func (s *Session) TTL(key string) int64 {
 		tx = tx.next
 	}
 
-	if exp, ok := s.db.expiry[key]; ok {
-		rem := time.Until(exp)
+	_, expiresAt, ok := s.db.hindex.Get(key)
+	if !ok {
+		return -2
+	}
+	if expiresAt > 0 {
+		rem := time.Until(time.Unix(0, expiresAt))
 		if rem <= 0 {
 			return -2
 		}
 		return int64(rem.Seconds())
 	}
-	if _, ok := s.db.index[key]; ok {
-		return -1
-	}
-	return -2
+	return -1
 }
 
 // Persist removes the TTL from key.
@@ -287,44 +295,32 @@ func (s *Session) Persist(key string) bool {
 		}
 	}
 
-	if _, ok := s.db.expiry[key]; ok {
-		delete(s.db.expiry, key)
-		return true
+	addr, expiresAt, ok := s.db.hindex.Get(key)
+	if !ok || expiresAt == 0 {
+		return false
 	}
-	return false
+	s.db.hindex.Set(key, addr, 0) //nolint:errcheck
+	delete(s.db.expiry, key)
+	return true
 }
 
 // Count returns the number of keys whose value equals value.
-// This performs a full index scan with a disk read per key — O(n).
+// Performs a full index scan with one disk read per key — O(n).
 func (s *Session) Count(value string) int {
 	now := time.Now()
 
-	// Snapshot the index and transaction state under read lock
-	type entry struct {
-		key       string
-		addr      NeedleAddr
-		exp       time.Time
-		hasExp    bool
-	}
+	// Snapshot tx overrides under the read lock
 	s.db.mu.RLock()
-	entries := make([]entry, 0, len(s.db.index))
-	for k, addr := range s.db.index {
-		exp, hasExp := s.db.expiry[k]
-		entries = append(entries, entry{k, addr, exp, hasExp})
-	}
-	// Snapshot tx overrides
-	txOverride := make(map[string]string) // key → effective value ("" + deleted=true means deleted)
+	txOverride := make(map[string]string)
 	txDeleted := make(map[string]bool)
 	for tx := s.transactions.Peek(); tx != nil; tx = tx.next {
 		for k, v := range tx.store {
-			if _, seen := txOverride[k]; !seen {
-				if !txDeleted[k] {
-					txOverride[k] = v
-				}
+			if _, seen := txOverride[k]; !seen && !txDeleted[k] {
+				txOverride[k] = v
 			}
 		}
 		for k := range tx.deleted {
-			if _, seen := txOverride[k]; !seen {
+			if _, seen := txDeleted[k]; !seen {
 				txDeleted[k] = true
 			}
 		}
@@ -333,29 +329,26 @@ func (s *Session) Count(value string) int {
 
 	count := 0
 
-	// Count from committed index (disk reads, no lock held)
-	for _, e := range entries {
-		if txDeleted[e.key] {
-			continue
+	// Count from committed index (ForEach holds hindex.mu internally)
+	s.db.hindex.ForEach(now, func(key string, addr NeedleAddr, _ int64) bool { //nolint:errcheck
+		if txDeleted[key] {
+			return true
 		}
-		if _, overridden := txOverride[e.key]; overridden {
-			continue
+		if _, overridden := txOverride[key]; overridden {
+			return true
 		}
-		if e.hasExp && now.After(e.exp) {
-			continue
-		}
-		data, err := s.db.volumes.Read(e.addr)
+		data, err := s.db.volumes.Read(addr)
 		if err != nil {
-			continue
+			return true
 		}
 		if string(data) == value {
 			count++
 		}
-	}
+		return true
+	})
 
 	// Count from in-flight transaction writes
-	for k, v := range txOverride {
-		_ = k
+	for _, v := range txOverride {
 		if v == value {
 			count++
 		}
@@ -368,23 +361,18 @@ func (s *Session) Count(value string) int {
 // Pattern supports * (any sequence) and ? (any single char).
 // Results are sorted alphabetically.
 func (s *Session) Keys(pattern string) ([]string, error) {
-	s.db.mu.RLock()
-	defer s.db.mu.RUnlock()
+	// Validate pattern first
+	if _, err := globMatch(pattern, ""); err != nil {
+		return nil, fmt.Errorf("invalid pattern %q: %w", pattern, err)
+	}
 
-	now := time.Now()
 	var result []string
-	for key := range s.db.index {
-		if exp, ok := s.db.expiry[key]; ok && now.After(exp) {
-			continue
-		}
-		matched, err := globMatch(pattern, key)
-		if err != nil {
-			return nil, fmt.Errorf("invalid pattern %q: %w", pattern, err)
-		}
-		if matched {
+	s.db.hindex.ForEach(time.Now(), func(key string, _ NeedleAddr, _ int64) bool { //nolint:errcheck
+		if matchGlob(pattern, key) {
 			result = append(result, key)
 		}
-	}
+		return true
+	})
 	sort.Strings(result)
 	return result, nil
 }
@@ -395,17 +383,12 @@ func (s *Session) Scan(cursor, count int) (nextCursor int, keys []string) {
 	if count <= 0 {
 		count = 10
 	}
-	s.db.mu.RLock()
-	defer s.db.mu.RUnlock()
 
-	now := time.Now()
-	all := make([]string, 0, len(s.db.index))
-	for key := range s.db.index {
-		if exp, ok := s.db.expiry[key]; ok && now.After(exp) {
-			continue
-		}
+	var all []string
+	s.db.hindex.ForEach(time.Now(), func(key string, _ NeedleAddr, _ int64) bool { //nolint:errcheck
 		all = append(all, key)
-	}
+		return true
+	})
 	sort.Strings(all)
 
 	if cursor >= len(all) {

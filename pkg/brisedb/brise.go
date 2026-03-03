@@ -23,15 +23,15 @@ type walEntry struct {
 	VolumeID  uint32 `json:",omitempty"`
 	Offset    uint64 `json:",omitempty"`
 	Size      uint64 `json:",omitempty"`
-	ExpiresAt int64  `json:",omitempty"` // Unix seconds; 0 = no expiry
+	ExpiresAt int64  `json:",omitempty"` // Unix nanoseconds; 0 = no expiry
 }
 
 // BriseDB encapsulates shared database state. Thread-safe.
 // Transaction state lives in Session — one per connection.
 type BriseDB struct {
 	mu          sync.RWMutex
-	index       map[string]NeedleAddr // key → location in a volume file
-	expiry      map[string]time.Time  // keys with a TTL
+	hindex      *hashIndex           // persistent on-disk hash index (key → NeedleAddr)
+	expiry      map[string]time.Time // in-memory cache of TTL keys (subset of hindex)
 	pubsub      *PubSub
 	replication *replicationManager
 	volumes     *VolumeManager
@@ -77,8 +77,16 @@ func NewBriseDB(dataDir string, opts ...DBOptions) (*BriseDB, error) {
 		return nil, fmt.Errorf("open volumes: %w", err)
 	}
 
+	idxPath := filepath.Join(dataDir, "index.hash")
+	hindex, err := openHashIndex(idxPath, 0)
+	if err != nil {
+		walFile.Close()
+		volumes.Close()
+		return nil, fmt.Errorf("open hash index: %w", err)
+	}
+
 	db := &BriseDB{
-		index:       make(map[string]NeedleAddr),
+		hindex:      hindex,
 		expiry:      make(map[string]time.Time),
 		pubsub:      newPubSub(),
 		replication: newReplicationManager(),
@@ -88,10 +96,23 @@ func NewBriseDB(dataDir string, opts ...DBOptions) (*BriseDB, error) {
 		stopCh:      make(chan struct{}),
 	}
 
-	if err := db.replayWAL(); err != nil {
-		walFile.Close()
-		volumes.Close()
-		return nil, fmt.Errorf("replay WAL: %w", err)
+	// On first open (empty hash index), replay the WAL to rebuild it.
+	// On subsequent opens the hash index is already up-to-date.
+	if hindex.entryCount == 0 {
+		if err := db.replayWAL(); err != nil {
+			walFile.Close()
+			volumes.Close()
+			hindex.Close()
+			return nil, fmt.Errorf("replay WAL: %w", err)
+		}
+	} else {
+		// Rebuild the in-memory expiry cache from the hash index.
+		if err := db.rebuildExpiry(); err != nil {
+			walFile.Close()
+			volumes.Close()
+			hindex.Close()
+			return nil, fmt.Errorf("rebuild expiry cache: %w", err)
+		}
 	}
 
 	go db.evictionLoop()
@@ -114,7 +135,19 @@ func (db *BriseDB) NewSession() *Session {
 func (db *BriseDB) Close() error {
 	close(db.stopCh)
 	db.volumes.Close()
+	db.hindex.Close()
 	return db.walFile.Close()
+}
+
+// rebuildExpiry scans the hash index and repopulates db.expiry for all
+// keys that have a TTL.  Called on startup when the hash index already exists.
+func (db *BriseDB) rebuildExpiry() error {
+	return db.hindex.ForEach(time.Now(), func(key string, _ NeedleAddr, expiresAt int64) bool {
+		if expiresAt > 0 {
+			db.expiry[key] = time.Unix(0, expiresAt)
+		}
+		return true
+	})
 }
 
 // evictionLoop runs in the background and removes expired keys every second.
@@ -137,7 +170,7 @@ func (db *BriseDB) evictExpired() {
 	defer db.mu.Unlock()
 	for key, exp := range db.expiry {
 		if now.After(exp) {
-			delete(db.index, key)
+			db.hindex.Delete(key) //nolint:errcheck
 			delete(db.expiry, key)
 		}
 	}
@@ -164,41 +197,41 @@ func (db *BriseDB) replayWAL() error {
 	return scanner.Err()
 }
 
-// Compact rewrites the WAL with only live keys, discarding history and
-// already-expired entries. Volume files are not compacted (Phase 1).
+// Compact rewrites both the WAL and the hash index, discarding deleted and
+// expired entries. Volume files are not compacted (Phase 2 concern).
 func (db *BriseDB) Compact() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
 	now := time.Now()
+
+	// Compact the hash index first — this is the authoritative index.
+	if err := db.hindex.Compact(now); err != nil {
+		return fmt.Errorf("compact hash index: %w", err)
+	}
+
+	// Rewrite the WAL to match the compacted index (for crash recovery).
 	f, err := os.OpenFile(db.walPath, os.O_TRUNC|os.O_WRONLY, 0644)
 	if err != nil {
 		return fmt.Errorf("truncate WAL: %w", err)
 	}
 	w := bufio.NewWriter(f)
-	for key, addr := range db.index {
-		if exp, ok := db.expiry[key]; ok && now.After(exp) {
-			continue
-		}
+	walErr := db.hindex.ForEach(now, func(key string, addr NeedleAddr, expiresAt int64) bool {
 		op := walEntry{
-			Type:     "SET",
-			Key:      key,
-			VolumeID: addr.VolumeID,
-			Offset:   addr.Offset,
-			Size:     addr.Size,
+			Type:      "SET",
+			Key:       key,
+			VolumeID:  addr.VolumeID,
+			Offset:    addr.Offset,
+			Size:      addr.Size,
+			ExpiresAt: expiresAt,
 		}
-		if exp, ok := db.expiry[key]; ok {
-			op.ExpiresAt = exp.Unix()
-		}
-		data, err := json.Marshal(op)
-		if err != nil {
-			f.Close()
-			return fmt.Errorf("marshal WAL entry: %w", err)
-		}
-		if _, err := w.Write(append(data, '\n')); err != nil {
-			f.Close()
-			return fmt.Errorf("write WAL entry: %w", err)
-		}
+		data, _ := json.Marshal(op)
+		w.Write(append(data, '\n')) //nolint:errcheck
+		return true
+	})
+	if walErr != nil {
+		f.Close()
+		return fmt.Errorf("compact WAL write: %w", walErr)
 	}
 	if err := w.Flush(); err != nil {
 		f.Close()
@@ -229,25 +262,21 @@ func (db *BriseDB) writeWAL(op walEntry) error {
 	return nil
 }
 
-// applyEntry applies a single WAL entry to the in-memory index.
+// applyEntry applies a single WAL entry to the hash index and expiry cache.
 // Must be called with mu held (or during single-threaded replay).
 func (db *BriseDB) applyEntry(op walEntry) {
 	switch op.Type {
 	case "SET":
-		db.index[op.Key] = NeedleAddr{
-			VolumeID: op.VolumeID,
-			Offset:   op.Offset,
-			Size:     op.Size,
-		}
+		addr := NeedleAddr{VolumeID: op.VolumeID, Offset: op.Offset, Size: op.Size}
+		db.hindex.Set(op.Key, addr, op.ExpiresAt) //nolint:errcheck
 		if op.ExpiresAt > 0 {
 			db.expiry[op.Key] = time.Unix(op.ExpiresAt, 0)
 		} else {
 			delete(db.expiry, op.Key)
 		}
-		// Ensure volume is registered for subsequent reads
 		db.volumes.EnsureVolume(op.VolumeID) //nolint:errcheck
 	case "DELETE":
-		delete(db.index, op.Key)
+		db.hindex.Delete(op.Key) //nolint:errcheck
 		delete(db.expiry, op.Key)
 	}
 }
@@ -257,25 +286,17 @@ func (db *BriseDB) applyEntry(op walEntry) {
 func (db *BriseDB) Snapshot() [][]byte {
 	now := time.Now()
 
-	// Collect index under read lock
+	// Collect index via ForEach (no db.mu needed — hindex has its own lock).
 	type snap struct {
 		key       string
 		addr      NeedleAddr
 		expiresAt int64
 	}
-	db.mu.RLock()
-	snaps := make([]snap, 0, len(db.index))
-	for k, addr := range db.index {
-		if exp, ok := db.expiry[k]; ok {
-			if now.After(exp) {
-				continue
-			}
-			snaps = append(snaps, snap{k, addr, exp.Unix()})
-		} else {
-			snaps = append(snaps, snap{k, addr, 0})
-		}
-	}
-	db.mu.RUnlock()
+	var snaps []snap
+	db.hindex.ForEach(now, func(key string, addr NeedleAddr, expiresAt int64) bool { //nolint:errcheck
+		snaps = append(snaps, snap{key, addr, expiresAt})
+		return true
+	})
 
 	// Read values from volumes (no lock held)
 	result := make([][]byte, 0, len(snaps))
@@ -315,10 +336,9 @@ func (db *BriseDB) ApplyReplicationEntry(data []byte) error {
 	}
 
 	db.mu.Lock()
+	defer db.mu.Unlock()
 	db.applyEntry(op)
-	err := db.writeWAL(op)
-	db.mu.Unlock()
-	return err
+	return db.writeWAL(op)
 }
 
 // Replication returns the replication manager (used by the server handler).
