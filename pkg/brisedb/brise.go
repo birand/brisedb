@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sync"
 	"time"
 
 	"github.com/birand/brisedb/pkg/volumeserver"
@@ -28,18 +27,27 @@ type walEntry struct {
 	ExpiresAt int64  `json:",omitempty"` // Unix nanoseconds; 0 = no expiry
 }
 
+// walMsg is a request sent to the WAL flusher goroutine.
+// Normal writes set data; Compact swaps set newFile (data is nil).
+type walMsg struct {
+	data    []byte   // serialised WAL line (including trailing newline)
+	newFile *os.File // non-nil: swap the active WAL file after flushing pending data
+	done    chan error
+}
+
 // BriseDB encapsulates shared database state. Thread-safe.
 // Transaction state lives in Session — one per connection.
 type BriseDB struct {
-	mu          keyedMutex                   // sharded per-key RWMutex (64 shards)
-	walMu       sync.Mutex                   // serialises WAL file writes
-	hindex      *hashIndex                   // persistent on-disk hash index (key → NeedleAddr)
+	mu          keyedMutex                     // sharded per-key RWMutex (64 shards)
+	hindex      *hashIndex                     // persistent on-disk hash index (key → NeedleAddr)
 	expiry      [numShards]map[string]time.Time // TTL cache; shard i protected by mu.shards[i]
 	pubsub      *PubSub
 	replication *replicationManager
 	volumes     *VolumePool
 	walFile     *os.File
 	walPath     string
+	walCh       chan walMsg    // WAL write requests; consumed by walFlusher goroutine
+	walDone     chan struct{}  // closed by walFlusher after it drains and exits
 	stopCh      chan struct{}
 }
 
@@ -123,6 +131,8 @@ func NewBriseDB(dataDir string, opts ...DBOptions) (*BriseDB, error) {
 		volumes:     volumes,
 		walFile:     walFile,
 		walPath:     walPath,
+		walCh:       make(chan walMsg, 1024),
+		walDone:     make(chan struct{}),
 		stopCh:      make(chan struct{}),
 	}
 	for i := range db.expiry {
@@ -149,6 +159,7 @@ func NewBriseDB(dataDir string, opts ...DBOptions) (*BriseDB, error) {
 	}
 
 	go db.evictionLoop()
+	go db.walFlusher()
 
 	return db, nil
 }
@@ -167,6 +178,7 @@ func (db *BriseDB) NewSession() *Session {
 // Close stops background goroutines and closes all files.
 func (db *BriseDB) Close() error {
 	close(db.stopCh)
+	<-db.walDone // wait for walFlusher to drain remaining entries and exit
 	db.volumes.Close()
 	db.hindex.Close()
 	return db.walFile.Close()
@@ -274,30 +286,133 @@ func (db *BriseDB) Compact() error {
 	}
 	f.Close()
 
-	db.walFile.Close()
-	db.walFile, err = os.OpenFile(db.walPath, os.O_APPEND|os.O_RDWR, 0644)
+	newWAL, err := os.OpenFile(db.walPath, os.O_APPEND|os.O_RDWR, 0644)
 	if err != nil {
 		return fmt.Errorf("reopen WAL after compact: %w", err)
 	}
+
+	// Hand the new file to the flusher goroutine. It will flush any buffered
+	// data to the old file first, then switch to newWAL atomically.
+	done := make(chan error, 1)
+	db.walCh <- walMsg{newFile: newWAL, done: done}
+	if err := <-done; err != nil {
+		return fmt.Errorf("swap WAL file: %w", err)
+	}
+	db.walFile.Close()
+	db.walFile = newWAL
 	return nil
 }
 
-// writeWAL appends a walEntry to the WAL file.
-// Value is stripped before writing — the WAL only stores needle addresses.
-// Acquires walMu internally; safe to call with any shard lock held.
+// writeWAL enqueues a WAL entry for the flusher goroutine and waits until
+// the entry has been written to disk. Value is stripped before writing.
 func (db *BriseDB) writeWAL(op walEntry) error {
 	op.Value = "" // never persist value in WAL
 	data, err := json.Marshal(op)
 	if err != nil {
 		return fmt.Errorf("marshal WAL entry: %w", err)
 	}
-	db.walMu.Lock()
-	_, err = db.walFile.Write(append(data, '\n'))
-	db.walMu.Unlock()
-	if err != nil {
+	done := make(chan error, 1)
+	db.walCh <- walMsg{data: append(data, '\n'), done: done}
+	if err := <-done; err != nil {
 		return fmt.Errorf("write WAL: %w", err)
 	}
 	return nil
+}
+
+// walFlusher is the sole goroutine that writes to the WAL file.
+// It batches concurrent requests and flushes them in a single syscall,
+// then signals all waiting callers.
+func (db *BriseDB) walFlusher() {
+	defer close(db.walDone)
+	bw := bufio.NewWriterSize(db.walFile, 64<<10)
+
+	flushBatch := func(batch []walMsg) error {
+		var writeErr error
+		for _, m := range batch {
+			if len(m.data) > 0 {
+				if _, err := bw.Write(m.data); err != nil && writeErr == nil {
+					writeErr = err
+				}
+			}
+		}
+		if err := bw.Flush(); err != nil && writeErr == nil {
+			writeErr = err
+		}
+		return writeErr
+	}
+
+	handleSpecial := func(msg walMsg) {
+		if msg.newFile != nil {
+			// File-swap from Compact: flush buffered data, switch file.
+			err := bw.Flush()
+			msg.done <- err
+			bw = bufio.NewWriterSize(msg.newFile, 64<<10)
+		} else {
+			// Zero-data barrier message.
+			msg.done <- bw.Flush()
+		}
+	}
+
+	for {
+		var batch []walMsg
+
+		// Block until at least one message or shutdown.
+		select {
+		case msg := <-db.walCh:
+			if msg.newFile != nil || len(msg.data) == 0 {
+				handleSpecial(msg)
+				continue
+			}
+			batch = append(batch, msg)
+		case <-db.stopCh:
+			// Drain remaining messages so callers are not left blocking.
+			for {
+				select {
+				case msg := <-db.walCh:
+					if msg.newFile != nil || len(msg.data) == 0 {
+						handleSpecial(msg)
+					} else {
+						batch = append(batch, msg)
+					}
+				default:
+					err := flushBatch(batch)
+					for _, m := range batch {
+						m.done <- err
+					}
+					return
+				}
+			}
+		}
+
+		// Drain any additional messages already queued (non-blocking).
+	drain:
+		for len(batch) < 512 {
+			select {
+			case msg := <-db.walCh:
+				if msg.newFile != nil || len(msg.data) == 0 {
+					// Flush current batch first, then handle the special msg.
+					err := flushBatch(batch)
+					for _, m := range batch {
+						m.done <- err
+					}
+					batch = nil
+					handleSpecial(msg)
+					break drain
+				}
+				batch = append(batch, msg)
+			default:
+				break drain
+			}
+		}
+
+		if len(batch) == 0 {
+			continue
+		}
+		err := flushBatch(batch)
+		for _, m := range batch {
+			m.done <- err
+		}
+	}
 }
 
 // applyEntry applies a single WAL entry to the hash index and expiry cache.
