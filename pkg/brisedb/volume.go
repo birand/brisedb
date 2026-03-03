@@ -234,6 +234,32 @@ func (vm *VolumeManager) EnsureVolume(id uint32) error {
 	return fmt.Errorf("volume %d not found in any drive", id)
 }
 
+// WriteToVolume appends data to a specific volume identified by id.
+// The volume is opened (or created in the first drive) if not already loaded.
+// This is used by VolumePool to write to a group-assigned volume ID so that
+// all replica members maintain identical byte sequences and offsets.
+func (vm *VolumeManager) WriteToVolume(id uint32, data []byte) (NeedleAddr, error) {
+	vm.mu.Lock()
+	v, ok := vm.volumes[id]
+	if !ok {
+		// Create the volume in the primary (first) drive.
+		dir := vm.drives[0]
+		path := filepath.Join(dir, fmt.Sprintf("vol-%06d.data", id))
+		newV, err := openVolume(id, dir, path)
+		if err != nil {
+			vm.mu.Unlock()
+			return NeedleAddr{}, fmt.Errorf("WriteToVolume create %d: %w", id, err)
+		}
+		vm.volumes[id] = newV
+		if id >= vm.nextID {
+			vm.nextID = id + 1
+		}
+		v = newV
+	}
+	vm.mu.Unlock()
+	return v.write(data)
+}
+
 // Write appends data to the next available drive's active volume,
 // rotating to a new volume file if the current one is full.
 func (vm *VolumeManager) Write(data []byte) (NeedleAddr, error) {

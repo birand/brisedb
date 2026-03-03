@@ -43,11 +43,14 @@ func main() {
 			if err != nil {
 				return volumeserver.WriteResult{}, err
 			}
-			return volumeserver.WriteResult{
-				VolumeID: addr.VolumeID,
-				Offset:   addr.Offset,
-				Size:     addr.Size,
-			}, nil
+			return volumeserver.WriteResult{VolumeID: addr.VolumeID, Offset: addr.Offset, Size: addr.Size}, nil
+		},
+		WriteToVolumeFn: func(id uint32, data []byte) (volumeserver.WriteResult, error) {
+			addr, err := vm.WriteToVolume(id, data)
+			if err != nil {
+				return volumeserver.WriteResult{}, err
+			}
+			return volumeserver.WriteResult{VolumeID: addr.VolumeID, Offset: addr.Offset, Size: addr.Size}, nil
 		},
 		ReadFn: func(volID uint32, offset, size uint64) ([]byte, error) {
 			return vm.Read(brisedb.NeedleAddr{VolumeID: volID, Offset: offset, Size: size})

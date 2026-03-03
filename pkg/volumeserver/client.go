@@ -23,6 +23,26 @@ func NewClient(baseURL string) *Client {
 	}
 }
 
+// WriteToVolume sends data to a specific volume on the remote server.
+// Used for replicated writes to ensure all group members use the same volume ID.
+func (c *Client) WriteToVolume(id uint32, data []byte) (WriteResult, error) {
+	url := fmt.Sprintf("%s/write?vol=%d", c.baseURL, id)
+	resp, err := c.http.Post(url, "application/octet-stream", bytes.NewReader(data))
+	if err != nil {
+		return WriteResult{}, fmt.Errorf("volume client write-to-volume: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return WriteResult{}, fmt.Errorf("volume client write-to-volume: server returned %d: %s", resp.StatusCode, body)
+	}
+	var result WriteResult
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return WriteResult{}, fmt.Errorf("volume client write-to-volume: decode: %w", err)
+	}
+	return result, nil
+}
+
 // Write sends data to the remote volume server and returns the blob address.
 func (c *Client) Write(data []byte) (WriteResult, error) {
 	resp, err := c.http.Post(c.baseURL+"/write", "application/octet-stream", bytes.NewReader(data))

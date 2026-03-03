@@ -56,6 +56,11 @@ type DBOptions struct {
 	// (e.g. "http://10.0.0.2:8081"). When set, blob writes are distributed
 	// across local drives and remote servers in round-robin order.
 	VolumeServers []string
+
+	// ReplicationFactor controls how many copies of each blob are stored
+	// across the available backends. 1 = no replication (default).
+	// Must be ≤ len(VolumeServers) + 1 (local counts as one backend).
+	ReplicationFactor int
 }
 
 // NewBriseDB opens (or creates) the database at dataDir.
@@ -90,7 +95,7 @@ func NewBriseDB(dataDir string, opts ...DBOptions) (*BriseDB, error) {
 		remotes = append(remotes, volumeserver.NewClient(url))
 	}
 
-	volumes, err := newVolumePool(localVM, remotes, dataDir)
+	volumes, err := newVolumePool(localVM, remotes, dataDir, opt.ReplicationFactor)
 	if err != nil {
 		walFile.Close()
 		localVM.Close()

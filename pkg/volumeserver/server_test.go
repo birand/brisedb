@@ -13,6 +13,10 @@ type memBackend struct {
 	blobs [][]byte
 }
 
+func (m *memBackend) WriteToVolume(_ uint32, data []byte) (volumeserver.WriteResult, error) {
+	return m.Write(data) // reuse same logic for tests
+}
+
 func (m *memBackend) Write(data []byte) (volumeserver.WriteResult, error) {
 	id := uint32(len(m.blobs))
 	m.blobs = append(m.blobs, data)

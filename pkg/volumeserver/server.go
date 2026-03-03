@@ -18,6 +18,9 @@ import (
 // Backend is the minimal interface a VolumeServer needs from its storage layer.
 type Backend interface {
 	Write(data []byte) (WriteResult, error)
+	// WriteToVolume appends data to the specified volume (creating it if needed).
+	// Used for replicated writes where all members must use the same volume ID.
+	WriteToVolume(id uint32, data []byte) (WriteResult, error)
 	Read(volID uint32, offset, size uint64) ([]byte, error)
 	Stats() []VolumeStat
 }
@@ -67,7 +70,8 @@ func (s *Server) ListenAndServe(addr string) error {
 }
 
 // handleWrite receives raw bytes and appends them to a volume.
-// POST /write
+// POST /write          — auto-selects volume (normal write)
+// POST /write?vol=N    — appends to volume N (replica/group write)
 // Body: raw blob bytes
 // Response: JSON WriteResult
 func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request) {
@@ -80,11 +84,27 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("read body: %v", err), http.StatusBadRequest)
 		return
 	}
-	result, err := s.backend.Write(data)
-	if err != nil {
-		s.log.Error("write failed", "error", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+
+	var result WriteResult
+	if volStr := r.URL.Query().Get("vol"); volStr != "" {
+		volID, err := parseUint32(volStr)
+		if err != nil {
+			http.Error(w, "bad vol: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		result, err = s.backend.WriteToVolume(volID, data)
+		if err != nil {
+			s.log.Error("write-to-volume failed", "vol", volID, "error", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	} else {
+		result, err = s.backend.Write(data)
+		if err != nil {
+			s.log.Error("write failed", "error", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(result)
