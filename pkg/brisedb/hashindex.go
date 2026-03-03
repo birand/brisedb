@@ -6,6 +6,7 @@ import (
 	"hash/fnv"
 	"os"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -51,10 +52,11 @@ type hashIndex struct {
 	f           *os.File
 	path        string
 	bucketCount uint64
-	bucketBase  int64 // file offset of the first bucket slot
-	dataBase    int64 // file offset of the first entry
-	writePos    int64 // next append offset (= current file size)
-	entryCount  int64 // live entries (informational)
+	bucketBase  int64  // file offset of the first bucket slot
+	dataBase    int64  // file offset of the first entry
+	writePos    int64  // next append offset (= current file size)
+	entryCount  int64  // live entries (informational)
+	mmapData    []byte // MAP_SHARED read-only mmap of [0, dataBase); nil = fallback to pread
 }
 
 // openHashIndex opens or creates the hash index at path.
@@ -94,7 +96,29 @@ func openHashIndex(path string, bucketCount uint64) (*hashIndex, error) {
 		}
 		hi.writePos = info.Size()
 	}
+	hi.mapBuckets()
 	return hi, nil
+}
+
+// mapBuckets memory-maps the header + bucket table region of the index file.
+// Reads from the bucket table then use direct memory access instead of pread.
+// Writes still go through f.WriteAt; MAP_SHARED ensures the mmap sees them.
+// On any error the mmap is silently skipped and pread is used as fallback.
+func (hi *hashIndex) mapBuckets() {
+	size := int(hi.dataBase) // header (64 B) + bucket table (bucketCount × 8 B)
+	data, err := syscall.Mmap(int(hi.f.Fd()), 0, size,
+		syscall.PROT_READ, syscall.MAP_SHARED)
+	if err == nil {
+		hi.mmapData = data
+	}
+}
+
+// unmapBuckets releases the mmap region if one is active.
+func (hi *hashIndex) unmapBuckets() {
+	if hi.mmapData != nil {
+		syscall.Munmap(hi.mmapData) //nolint:errcheck
+		hi.mmapData = nil
+	}
 }
 
 func (hi *hashIndex) initFile() error {
@@ -147,6 +171,10 @@ func (hi *hashIndex) bucketFileOffset(key string) int64 {
 }
 
 func (hi *hashIndex) readBucket(boff int64) (int64, error) {
+	if hi.mmapData != nil {
+		// Zero-syscall path: read directly from the memory-mapped bucket table.
+		return int64(binary.LittleEndian.Uint64(hi.mmapData[boff : boff+8])), nil
+	}
 	var buf [8]byte
 	if _, err := hi.f.ReadAt(buf[:], boff); err != nil {
 		return 0, err
@@ -404,6 +432,7 @@ func (hi *hashIndex) Compact(now time.Time) error {
 	// Reopen the compacted file in-place
 	hi.mu.Lock()
 	defer hi.mu.Unlock()
+	hi.unmapBuckets()
 	hi.f.Close()
 
 	f, err := os.OpenFile(hi.path, os.O_RDWR, 0644)
@@ -417,6 +446,7 @@ func (hi *hashIndex) Compact(now time.Time) error {
 	hi.bucketBase = hiHeaderSize
 	hi.writePos = info.Size()
 	hi.entryCount = int64(len(live))
+	hi.mapBuckets()
 	return nil
 }
 
@@ -424,6 +454,7 @@ func (hi *hashIndex) Compact(now time.Time) error {
 func (hi *hashIndex) Close() error {
 	hi.mu.Lock()
 	defer hi.mu.Unlock()
+	hi.unmapBuckets()
 	// Persist the entry count in the header before closing
 	hdr := hi.encodeHeader()
 	hi.f.WriteAt(hdr, 0) //nolint:errcheck
