@@ -273,7 +273,8 @@ func (db *BriseDB) Compact() error {
 			ExpiresAt: expiresAt,
 		}
 		data, _ := json.Marshal(op)
-		w.Write(append(data, '\n')) //nolint:errcheck
+		w.Write(data)         //nolint:errcheck
+		w.WriteByte('\n')     //nolint:errcheck
 		return true
 	})
 	if walErr != nil {
@@ -312,7 +313,7 @@ func (db *BriseDB) writeWAL(op walEntry) error {
 		return fmt.Errorf("marshal WAL entry: %w", err)
 	}
 	done := make(chan error, 1)
-	db.walCh <- walMsg{data: append(data, '\n'), done: done}
+	db.walCh <- walMsg{data: data, done: done} // flusher appends the newline
 	if err := <-done; err != nil {
 		return fmt.Errorf("write WAL: %w", err)
 	}
@@ -332,6 +333,8 @@ func (db *BriseDB) walFlusher() {
 			if len(m.data) > 0 {
 				if _, err := bw.Write(m.data); err != nil && writeErr == nil {
 					writeErr = err
+				} else if err == nil {
+					bw.WriteByte('\n') //nolint:errcheck
 				}
 			}
 		}

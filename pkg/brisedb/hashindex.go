@@ -10,6 +10,14 @@ import (
 	"time"
 )
 
+// indexEntryBufPool pools []byte buffers used by encodeIndexEntry and
+// readEntryAt to avoid per-call heap allocations on every read/write.
+// A capacity of 256 bytes covers keys up to ~185 characters without
+// falling back to a fresh allocation.
+var indexEntryBufPool = sync.Pool{
+	New: func() any { b := make([]byte, 0, 256); return &b },
+}
+
 // DefaultBucketCount is the initial hash table size (1M buckets = 8 MiB bucket table).
 // At an average load factor of 1, this supports 1M keys before chains lengthen.
 // Compact() rewrites the index with a larger bucket table when load > 2.
@@ -193,21 +201,29 @@ func (hi *hashIndex) writeBucket(boff, entryOff int64) error {
 // Entry encoding / decoding
 // ------------------------------------------------------------------ //
 
-func encodeIndexEntry(next int64, key string, addr NeedleAddr, expiresAt int64, deleted bool) []byte {
-	kb := []byte(key)
-	buf := make([]byte, 8+2+len(kb)+4+8+8+8+1)
-	o := 0
-	binary.LittleEndian.PutUint64(buf[o:], uint64(next)); o += 8
-	binary.LittleEndian.PutUint16(buf[o:], uint16(len(kb))); o += 2
-	copy(buf[o:], kb); o += len(kb)
-	binary.LittleEndian.PutUint32(buf[o:], addr.VolumeID); o += 4
-	binary.LittleEndian.PutUint64(buf[o:], addr.Offset); o += 8
-	binary.LittleEndian.PutUint64(buf[o:], addr.Size); o += 8
-	binary.LittleEndian.PutUint64(buf[o:], uint64(expiresAt)); o += 8
-	if deleted {
-		buf[o] = 1
+// encodeIndexEntry serialises an index entry into buf, growing it if needed.
+// The caller owns buf and must not use it after returning it to a pool.
+func encodeIndexEntry(buf *[]byte, next int64, key string, addr NeedleAddr, expiresAt int64, deleted bool) {
+	need := 8 + 2 + len(key) + 4 + 8 + 8 + 8 + 1
+	if cap(*buf) < need {
+		*buf = make([]byte, need)
+	} else {
+		*buf = (*buf)[:need]
 	}
-	return buf
+	b := *buf
+	o := 0
+	binary.LittleEndian.PutUint64(b[o:], uint64(next)); o += 8
+	binary.LittleEndian.PutUint16(b[o:], uint16(len(key))); o += 2
+	copy(b[o:], key); o += len(key)
+	binary.LittleEndian.PutUint32(b[o:], addr.VolumeID); o += 4
+	binary.LittleEndian.PutUint64(b[o:], addr.Offset); o += 8
+	binary.LittleEndian.PutUint64(b[o:], addr.Size); o += 8
+	binary.LittleEndian.PutUint64(b[o:], uint64(expiresAt)); o += 8
+	if deleted {
+		b[o] = 1
+	} else {
+		b[o] = 0
+	}
 }
 
 type idxEntry struct {
@@ -228,17 +244,26 @@ func (hi *hashIndex) readEntryAt(pos int64) (idxEntry, error) {
 	next := int64(binary.LittleEndian.Uint64(prefix[0:8]))
 	keyLen := int(binary.LittleEndian.Uint16(prefix[8:10]))
 
-	tail := make([]byte, keyLen+4+8+8+8+1)
+	need := keyLen + 4 + 8 + 8 + 8 + 1
+	bp := indexEntryBufPool.Get().(*[]byte)
+	if cap(*bp) < need {
+		*bp = make([]byte, need)
+	} else {
+		*bp = (*bp)[:need]
+	}
+	tail := *bp
 	if _, err := hi.f.ReadAt(tail, pos+10); err != nil {
+		indexEntryBufPool.Put(bp)
 		return idxEntry{}, fmt.Errorf("hash index read tail at %d: %w", pos, err)
 	}
 	o := 0
-	key := string(tail[o : o+keyLen]); o += keyLen
+	key := string(tail[o : o+keyLen]); o += keyLen // string() copies bytes
 	volID := binary.LittleEndian.Uint32(tail[o:]); o += 4
 	offset := binary.LittleEndian.Uint64(tail[o:]); o += 8
 	sz := binary.LittleEndian.Uint64(tail[o:]); o += 8
 	expiresAt := int64(binary.LittleEndian.Uint64(tail[o:])); o += 8
 	deleted := tail[o] != 0
+	indexEntryBufPool.Put(bp)
 
 	totalSize := int64(8 + 2 + keyLen + 4 + 8 + 8 + 8 + 1)
 	return idxEntry{
@@ -294,9 +319,13 @@ func (hi *hashIndex) Set(key string, addr NeedleAddr, expiresAt int64) error {
 		return err
 	}
 
-	entry := encodeIndexEntry(oldHead, key, addr, expiresAt, false)
+	bp := indexEntryBufPool.Get().(*[]byte)
+	encodeIndexEntry(bp, oldHead, key, addr, expiresAt, false)
+	entry := *bp
 	newOff := hi.writePos
-	if _, err := hi.f.WriteAt(entry, newOff); err != nil {
+	_, err = hi.f.WriteAt(entry, newOff)
+	indexEntryBufPool.Put(bp)
+	if err != nil {
 		return fmt.Errorf("hash index set %q: %w", key, err)
 	}
 	hi.writePos += int64(len(entry))
@@ -316,9 +345,13 @@ func (hi *hashIndex) Delete(key string) error {
 		return err
 	}
 
-	entry := encodeIndexEntry(oldHead, key, NeedleAddr{}, 0, true)
+	bp := indexEntryBufPool.Get().(*[]byte)
+	encodeIndexEntry(bp, oldHead, key, NeedleAddr{}, 0, true)
+	entry := *bp
 	newOff := hi.writePos
-	if _, err := hi.f.WriteAt(entry, newOff); err != nil {
+	_, err = hi.f.WriteAt(entry, newOff)
+	indexEntryBufPool.Put(bp)
+	if err != nil {
 		return fmt.Errorf("hash index delete %q: %w", key, err)
 	}
 	hi.writePos += int64(len(entry))
