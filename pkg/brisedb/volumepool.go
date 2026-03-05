@@ -273,19 +273,16 @@ func (p *VolumePool) Close() error {
 // getOrCreateGroup returns the active group, creating a new one if needed.
 // Caller must hold p.mu.
 func (p *VolumePool) getOrCreateGroup() (*volumeGroup, error) {
-	// Reuse active group if it hasn't been rotated away by the local manager.
+	// Reuse active group if its primary volume still has room.
 	if p.activeGroup != nil {
 		primary := p.activeGroup.Members[0]
-		// Check if the local manager still has room (i.e. the active local volume
-		// matches the group ID). If the local manager rotated, the next call to
-		// WriteToVolume will create a fresh file anyway — detect this lazily.
 		if primary.ServerURL == "" {
-			// Still valid as long as local hasn't silently rotated.
-			// We detect rotation by checking nextID on the local manager.
+			// Local primary: reuse until the volume hits the size limit.
 			p.local.mu.Lock()
-			localCurrent := p.local.driveCurrent[0]
+			v := p.local.volumes[p.activeGroup.ID]
+			maxSize := p.local.maxVolumeSize
 			p.local.mu.Unlock()
-			if localCurrent != nil && localCurrent.id == p.activeGroup.ID {
+			if v != nil && v.size() < maxSize {
 				return p.activeGroup, nil
 			}
 		} else {

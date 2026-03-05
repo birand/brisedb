@@ -311,6 +311,40 @@ brisedb-data/
 
 ---
 
+## Benchmarks
+
+Measured on Apple M1, Go 1.24, local disk (`-benchtime=1s`).
+
+| Benchmark | ops/s | ns/op | allocs/op |
+|---|---|---|---|
+| Set (single key, WAL flush) | ~92 K | 10 821 | 10 |
+| Get (cache miss) | ~568 K | 2 143 | 3 |
+| Get (miss / not found) | ~42 M | 28 | 0 |
+| Delete | ~691 K | 1 482 | 3 |
+| SetBlob 1 KB | ~92 K | 13 028 | 10 |
+| SetBlob 64 KB | ~12 K | 104 181 | 10 |
+| SetBlob 1 MB | ~866 | 1 513 876 | 13 |
+| SetBlobStream 1 MB (zero-copy) | ~1 797 | 1 023 929 | — |
+| GetBlob 1 KB | ~427 K | 2 420 | 2 |
+| GetBlob 64 KB | ~149 K | 7 983 | 2 |
+| GetBlob 1 MB (cached) | ~1 M | 1 062 | 1 |
+| Transaction (1 key) | ~106 K | 11 221 | 19 |
+| Transaction (10 keys) | ~10 K | 103 723 | 104 |
+| Rollback | ~5 M | 231 | 6 |
+| HashIndex Set | ~310 K | 3 544 | 1 |
+| HashIndex Get | ~1 M | 1 041 | 1 |
+| HashIndex GetMiss | ~84 M | 14 | 0 |
+| Set (8 goroutines, WAL group-commit) | ~135 K | 8 830 | 9 |
+| Mixed 80%R/20%W (8 goroutines) | ~283 K | 4 125 | 5 |
+
+Run benchmarks:
+
+```bash
+go test ./pkg/brisedb/ -bench=. -benchtime=1s -benchmem
+```
+
+---
+
 ## Development
 
 ```bash
