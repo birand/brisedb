@@ -11,6 +11,23 @@ import (
 	"github.com/birand/brisedb/pkg/volumeserver"
 )
 
+// FsyncMode controls when the WAL flusher calls fsync after writing.
+type FsyncMode int
+
+const (
+	// FsyncEverySec syncs the WAL to disk at most once per second (default).
+	// A crash can lose at most ~1 second of committed writes.
+	FsyncEverySec FsyncMode = iota
+
+	// FsyncAlways syncs the WAL after every batch of writes.
+	// Safest: zero data loss on crash; slowest under high write load.
+	FsyncAlways
+
+	// FsyncNo never calls fsync. The OS flushes at its own discretion.
+	// Fastest; a crash can lose any unflushed writes.
+	FsyncNo
+)
+
 /* Map string:string */
 type Map = map[string]string
 
@@ -49,6 +66,7 @@ type BriseDB struct {
 	walCh       chan walMsg    // WAL write requests; consumed by walFlusher goroutine
 	walDone     chan struct{}  // closed by walFlusher after it drains and exits
 	stopCh      chan struct{}
+	fsyncMode   FsyncMode
 }
 
 // DBOptions configures optional behaviour of NewBriseDB.
@@ -75,6 +93,10 @@ type DBOptions struct {
 	// LRU read cache. 0 disables caching (default).
 	// Example: 256 * 1024 * 1024 for a 256 MiB cache.
 	CacheSize uint64
+
+	// Fsync controls when the WAL flusher calls fsync after writing.
+	// Default (zero value) is FsyncEverySec.
+	Fsync FsyncMode
 }
 
 // NewBriseDB opens (or creates) the database at dataDir.
@@ -134,6 +156,7 @@ func NewBriseDB(dataDir string, opts ...DBOptions) (*BriseDB, error) {
 		walCh:       make(chan walMsg, 1024),
 		walDone:     make(chan struct{}),
 		stopCh:      make(chan struct{}),
+		fsyncMode:   opt.Fsync,
 	}
 	for i := range db.expiry {
 		db.expiry[i] = make(map[string]time.Time)
@@ -322,10 +345,35 @@ func (db *BriseDB) writeWAL(op walEntry) error {
 
 // walFlusher is the sole goroutine that writes to the WAL file.
 // It batches concurrent requests and flushes them in a single syscall,
-// then signals all waiting callers.
+// then optionally calls fsync according to db.fsyncMode:
+//
+//   - FsyncAlways:   fsync after every batch (safest, slowest)
+//   - FsyncEverySec: fsync at most once per second (default)
+//   - FsyncNo:       never fsync (fastest, OS decides when to flush)
 func (db *BriseDB) walFlusher() {
 	defer close(db.walDone)
-	bw := bufio.NewWriterSize(db.walFile, 64<<10)
+
+	// currentFile tracks which *os.File backs bw so we can call Sync on it.
+	currentFile := db.walFile
+	bw := bufio.NewWriterSize(currentFile, 64<<10)
+
+	// pendingSync is set to true whenever data has been flushed to the OS
+	// buffer but not yet fsync'd. Only used for FsyncEverySec.
+	pendingSync := false
+
+	// syncTicker fires once per second for FsyncEverySec mode.
+	// For other modes we still create the ticker but never act on it, so
+	// the select cases are compiled-away-equivalent (no goroutine overhead
+	// beyond the ticker itself, which is negligible).
+	syncTicker := time.NewTicker(time.Second)
+	defer syncTicker.Stop()
+
+	// doSync calls fsync on currentFile and clears pendingSync.
+	doSync := func() error {
+		err := currentFile.Sync()
+		pendingSync = false
+		return err
+	}
 
 	flushBatch := func(batch []walMsg) error {
 		var writeErr error
@@ -341,25 +389,46 @@ func (db *BriseDB) walFlusher() {
 		if err := bw.Flush(); err != nil && writeErr == nil {
 			writeErr = err
 		}
+		if writeErr != nil {
+			return writeErr
+		}
+
+		switch db.fsyncMode {
+		case FsyncAlways:
+			writeErr = doSync()
+		case FsyncEverySec:
+			pendingSync = true
+		// FsyncNo: do nothing
+		}
 		return writeErr
 	}
 
 	handleSpecial := func(msg walMsg) {
 		if msg.newFile != nil {
-			// File-swap from Compact: flush buffered data, switch file.
+			// File-swap from Compact: flush + sync the old file so the new
+			// compacted WAL is durable before we start appending to it.
 			err := bw.Flush()
+			if err == nil && db.fsyncMode != FsyncNo {
+				err = doSync()
+			}
 			msg.done <- err
-			bw = bufio.NewWriterSize(msg.newFile, 64<<10)
+			currentFile = msg.newFile
+			bw = bufio.NewWriterSize(currentFile, 64<<10)
 		} else {
-			// Zero-data barrier message.
-			msg.done <- bw.Flush()
+			// Zero-data barrier message: flush + sync so the caller can rely
+			// on durability (used by tests and explicit Sync() calls).
+			err := bw.Flush()
+			if err == nil && db.fsyncMode != FsyncNo {
+				err = doSync()
+			}
+			msg.done <- err
 		}
 	}
 
 	for {
 		var batch []walMsg
 
-		// Block until at least one message or shutdown.
+		// Block until at least one message, a sync tick, or shutdown.
 		select {
 		case msg := <-db.walCh:
 			if msg.newFile != nil || len(msg.data) == 0 {
@@ -367,6 +436,11 @@ func (db *BriseDB) walFlusher() {
 				continue
 			}
 			batch = append(batch, msg)
+		case <-syncTicker.C:
+			if pendingSync {
+				doSync() //nolint:errcheck — best-effort periodic sync
+			}
+			continue
 		case <-db.stopCh:
 			// Drain remaining messages so callers are not left blocking.
 			for {
@@ -381,6 +455,10 @@ func (db *BriseDB) walFlusher() {
 					err := flushBatch(batch)
 					for _, m := range batch {
 						m.done <- err
+					}
+					// Final fsync on shutdown regardless of mode.
+					if err == nil {
+						currentFile.Sync() //nolint:errcheck
 					}
 					return
 				}
