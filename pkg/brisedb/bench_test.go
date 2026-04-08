@@ -398,3 +398,55 @@ func BenchmarkHashIndexGetMiss(b *testing.B) {
 		hi.Get("nosuchkey")
 	}
 }
+
+func BenchmarkHashIndexForEach(b *testing.B) {
+	for _, n := range []int{1_000, 10_000, 100_000} {
+		n := n
+		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
+			hi, err := openHashIndex(b.TempDir()+"/index.hash", 0)
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer hi.Close()
+			addr := NeedleAddr{VolumeID: 1, Offset: 0, Size: 16}
+			for i := 0; i < n; i++ {
+				hi.Set(fmt.Sprintf("key:%d", i), addr, 0)
+			}
+			now := time.Now()
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				hi.ForEach(now, func(_ string, _ NeedleAddr, _ int64) bool { return true })
+			}
+		})
+	}
+}
+
+func BenchmarkHashIndexCompact(b *testing.B) {
+	for _, n := range []int{1_000, 10_000, 100_000} {
+		n := n
+		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
+			addr := NeedleAddr{VolumeID: 1, Offset: 0, Size: 16}
+			now := time.Now()
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				b.StopTimer()
+				hi, err := openHashIndex(b.TempDir()+"/index.hash", 0)
+				if err != nil {
+					b.Fatal(err)
+				}
+				for j := 0; j < n; j++ {
+					hi.Set(fmt.Sprintf("key:%d", j), addr, 0)
+				}
+				b.StartTimer()
+				if err := hi.Compact(now); err != nil {
+					b.Fatalf("Compact: %v", err)
+				}
+				b.StopTimer()
+				hi.Close()
+				b.StartTimer()
+			}
+		})
+	}
+}

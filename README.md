@@ -315,6 +315,8 @@ brisedb-data/
 
 Measured on Apple M1, Go 1.24, local disk (`-benchtime=1s`).
 
+### Hot-path operations
+
 | Benchmark | ops/s | ns/op | allocs/op |
 |---|---|---|---|
 | Set (single key, WAL flush) | ~92 K | 10 821 | 10 |
@@ -336,6 +338,27 @@ Measured on Apple M1, Go 1.24, local disk (`-benchtime=1s`).
 | HashIndex GetMiss | ~84 M | 14 | 0 |
 | Set (8 goroutines, WAL group-commit) | ~135 K | 8 830 | 9 |
 | Mixed 80%R/20%W (8 goroutines) | ~283 K | 4 125 | 5 |
+
+### ForEach / Compact — memory vs. speed trade-off
+
+`ForEach` and `Compact` iterate the on-disk bucket table instead of loading all
+keys into a `map[string]...`.  RAM usage scales with chain depth (O(1) in
+practice) rather than with the total number of live keys.
+
+| Operation | Keys | RAM before | RAM after | Δ RAM | Speed before | Speed after |
+|---|---|---|---|---|---|---|
+| ForEach | 1 K | 283 KB | 8 KB | **−97%** | 1.4 ms | 12.8 ms |
+| ForEach | 10 K | 2.2 MB | 78 KB | **−96%** | 14.8 ms | 49.5 ms |
+| ForEach | 100 K | 19.6 MB | 1.5 MB | **−92%** | 148 ms | 496 ms |
+| Compact | 1 K | 8.9 MB | 8.4 MB | −6% | 20 ms | 45 ms |
+| Compact | 10 K | 12.5 MB | 8.5 MB | **−32%** | 77 ms | 130 ms |
+| Compact | 100 K | 43.6 MB | 9.9 MB | **−77%** | 569 ms | 943 ms |
+
+**Trade-off:** the bucket-chain scan avoids a global key map (prevents OOM on
+large datasets) but traverses the full 8 MiB bucket table on every call — a
+fixed overhead that dominates for small key counts.  Compact is typically
+run infrequently (e.g. via `COMPACT` command or a nightly cron), so the
+latency increase is acceptable in exchange for bounded memory usage.
 
 Run benchmarks:
 
