@@ -363,43 +363,64 @@ func (hi *hashIndex) Delete(key string) error {
 }
 
 // ForEach calls fn for every live, non-expired entry in the index.
-// It performs two passes over the data region so that the newest entry per
-// key is used (entries are stored oldest-first in the file).
+//
+// Instead of loading all keys into a map, it iterates the bucket table and
+// walks each chain from HEAD (newest) to tail.  Because entries are prepended
+// on every write, the first time a key appears in a chain IS its newest
+// version; subsequent occurrences are older and are skipped.
+//
+// RAM cost: O(max chain depth) — a small []string reused per chain slot,
+// typically 1-3 entries deep.  No global key map is allocated.
+//
 // fn must not call any hashIndex method (would deadlock on the read lock).
-// NOTE: Phase 3 limitation — all keys are held in memory during the scan.
 func (hi *hashIndex) ForEach(now time.Time, fn func(key string, addr NeedleAddr, expiresAt int64) bool) error {
 	hi.mu.RLock()
 	defer hi.mu.RUnlock()
 
-	type latestEntry struct {
-		addr      NeedleAddr
-		expiresAt int64
-		deleted   bool
-	}
+	nowNs := now.UnixNano()
 
-	// Pass 1: scan data region; newest occurrence of each key wins because
-	// later entries in the file overwrite earlier ones in our map.
-	latest := make(map[string]latestEntry)
-	pos := hi.dataBase
-	for pos < hi.writePos {
-		e, err := hi.readEntryAt(pos)
+	// seen tracks which keys have already been yielded for the current chain.
+	// Reused across slots (reset to [:0]) to avoid per-slot allocations.
+	// A slice is faster than a map for the short chains that arise in practice.
+	seen := make([]string, 0, 8)
+
+	for slot := uint64(0); slot < hi.bucketCount; slot++ {
+		boff := hi.bucketBase + int64(slot)*8
+		head, err := hi.readBucket(boff)
 		if err != nil {
-			return fmt.Errorf("hash index ForEach at %d: %w", pos, err)
+			return fmt.Errorf("hash index ForEach bucket %d: %w", slot, err)
 		}
-		latest[e.key] = latestEntry{e.addr, e.expiresAt, e.deleted}
-		pos += e.size
-	}
+		if head == 0 {
+			continue
+		}
 
-	// Pass 2: yield live, non-expired entries.
-	for key, e := range latest {
-		if e.deleted {
-			continue
-		}
-		if e.expiresAt > 0 && now.After(time.Unix(0, e.expiresAt)) {
-			continue
-		}
-		if !fn(key, e.addr, e.expiresAt) {
-			return nil
+		seen = seen[:0]
+		for off := head; off != 0; {
+			e, err := hi.readEntryAt(off)
+			if err != nil {
+				return fmt.Errorf("hash index ForEach at %d: %w", off, err)
+			}
+
+			// First occurrence in the chain = newest entry for this key.
+			// (Entries are prepended so HEAD is always newest.)
+			alreadySeen := false
+			for _, k := range seen {
+				if k == e.key {
+					alreadySeen = true
+					break
+				}
+			}
+
+			if !alreadySeen {
+				seen = append(seen, e.key)
+				if !e.deleted && !(e.expiresAt > 0 && nowNs > e.expiresAt) {
+					if !fn(e.key, e.addr, e.expiresAt) {
+						return nil
+					}
+				}
+			}
+
+			off = e.next
 		}
 	}
 	return nil
@@ -409,23 +430,21 @@ func (hi *hashIndex) ForEach(now time.Time, fn func(key string, addr NeedleAddr,
 // stale versions) and atomically replaces the current file.
 // The new bucket count is max(DefaultBucketCount, 2 × live_entries).
 // Caller must hold the database write lock.
+//
+// No intermediate key map is allocated. Live entries are streamed directly
+// from the bucket-chain iterator into the new index file.
 func (hi *hashIndex) Compact(now time.Time) error {
-	// Collect live entries (under our own lock via ForEach)
-	type entry struct {
-		addr      NeedleAddr
-		expiresAt int64
-	}
-	live := make(map[string]entry)
-	if err := hi.ForEach(now, func(key string, addr NeedleAddr, expiresAt int64) bool {
-		live[key] = entry{addr, expiresAt}
-		return true
-	}); err != nil {
-		return err
-	}
+	// Use the current entry count as an upper bound for bucket sizing.
+	// It may be slightly over-estimated (includes tombstoned entries not yet
+	// removed), so the new index might have a few extra empty buckets — that
+	// is harmless and corrects itself on the next Compact.
+	hi.mu.RLock()
+	estEntries := hi.entryCount
+	hi.mu.RUnlock()
 
 	newBuckets := DefaultBucketCount
-	if need := uint64(len(live)) * 2; need > newBuckets {
-		// Round up to next power of two
+	if need := uint64(estEntries) * 2; need > newBuckets {
+		// Round up to next power of two.
 		newBuckets = need
 		newBuckets--
 		for i := 1; i < 64; i <<= 1 {
@@ -440,15 +459,27 @@ func (hi *hashIndex) Compact(now time.Time) error {
 		return fmt.Errorf("hash index compact: open tmp: %w", err)
 	}
 
-	for key, e := range live {
-		if err := newHI.Set(key, e.addr, e.expiresAt); err != nil {
-			newHI.Close()
-			os.Remove(tmpPath)
-			return fmt.Errorf("hash index compact: write %q: %w", key, err)
+	// Stream live entries directly into the new index — no intermediate map.
+	var liveCount int64
+	var setErr error
+	iterErr := hi.ForEach(now, func(key string, addr NeedleAddr, expiresAt int64) bool {
+		if err := newHI.Set(key, addr, expiresAt); err != nil {
+			setErr = err
+			return false
 		}
+		liveCount++
+		return true
+	})
+	if iterErr != nil || setErr != nil {
+		newHI.Close()
+		os.Remove(tmpPath)
+		if setErr != nil {
+			return fmt.Errorf("hash index compact: write: %w", setErr)
+		}
+		return fmt.Errorf("hash index compact: %w", iterErr)
 	}
 
-	// Flush and sync before the rename
+	// Flush and sync before the rename.
 	if err := newHI.f.Sync(); err != nil {
 		newHI.Close()
 		os.Remove(tmpPath)
@@ -456,13 +487,13 @@ func (hi *hashIndex) Compact(now time.Time) error {
 	}
 	newHI.Close()
 
-	// Atomically replace the current index file
+	// Atomically replace the current index file.
 	if err := os.Rename(tmpPath, hi.path); err != nil {
 		os.Remove(tmpPath)
 		return fmt.Errorf("hash index compact: rename: %w", err)
 	}
 
-	// Reopen the compacted file in-place
+	// Reopen the compacted file in-place.
 	hi.mu.Lock()
 	defer hi.mu.Unlock()
 	hi.unmapBuckets()
@@ -478,7 +509,7 @@ func (hi *hashIndex) Compact(now time.Time) error {
 	hi.dataBase = hiHeaderSize + int64(newBuckets)*8
 	hi.bucketBase = hiHeaderSize
 	hi.writePos = info.Size()
-	hi.entryCount = int64(len(live))
+	hi.entryCount = liveCount
 	hi.mapBuckets()
 	return nil
 }
