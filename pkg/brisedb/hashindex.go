@@ -362,27 +362,78 @@ func (hi *hashIndex) Delete(key string) error {
 	return hi.writeBucket(boff, newOff)
 }
 
+// forEachThreshold is the entry count above which ForEach switches from the
+// fast sequential-scan strategy to the memory-safe bucket-chain strategy.
+// Below this threshold the data region is small enough (~4 MiB for 100K
+// entries) that loading it into a map is faster than traversing 8 MiB of
+// bucket-table slots.  Above it the map allocation becomes the bottleneck and
+// risks OOM on constrained hosts.
+const forEachThreshold = 100_000
+
 // ForEach calls fn for every live, non-expired entry in the index.
 //
-// Instead of loading all keys into a map, it iterates the bucket table and
-// walks each chain from HEAD (newest) to tail.  Because entries are prepended
-// on every write, the first time a key appears in a chain IS its newest
-// version; subsequent occurrences are older and are skipped.
+// Strategy is chosen automatically based on entryCount:
 //
-// RAM cost: O(max chain depth) — a small []string reused per chain slot,
-// typically 1-3 entries deep.  No global key map is allocated.
+//   - Small index (< forEachThreshold): sequential data-region scan into a
+//     map[string]latestEntry — fastest, O(N) RAM.
+//   - Large index (≥ forEachThreshold): bucket-chain traversal — O(max chain
+//     depth) RAM (typically a handful of strings), ~3× slower due to the fixed
+//     8 MiB bucket-table scan cost, but safe for millions of keys.
 //
 // fn must not call any hashIndex method (would deadlock on the read lock).
 func (hi *hashIndex) ForEach(now time.Time, fn func(key string, addr NeedleAddr, expiresAt int64) bool) error {
 	hi.mu.RLock()
 	defer hi.mu.RUnlock()
 
-	nowNs := now.UnixNano()
+	if hi.entryCount < forEachThreshold {
+		return hi.forEachSmall(now, fn)
+	}
+	return hi.forEachLarge(now, fn)
+}
 
-	// seen tracks which keys have already been yielded for the current chain.
-	// Reused across slots (reset to [:0]) to avoid per-slot allocations.
-	// A slice is faster than a map for the short chains that arise in practice.
-	seen := make([]string, 0, 8)
+// forEachSmall is the fast path for small indexes: one linear pass over the
+// data region builds a map of the newest entry per key, then a second pass
+// yields live non-expired entries.  RAM: O(entryCount).
+func (hi *hashIndex) forEachSmall(now time.Time, fn func(key string, addr NeedleAddr, expiresAt int64) bool) error {
+	type latestEntry struct {
+		addr      NeedleAddr
+		expiresAt int64
+		deleted   bool
+	}
+
+	latest := make(map[string]latestEntry, hi.entryCount)
+	pos := hi.dataBase
+	for pos < hi.writePos {
+		e, err := hi.readEntryAt(pos)
+		if err != nil {
+			return fmt.Errorf("hash index ForEach at %d: %w", pos, err)
+		}
+		latest[e.key] = latestEntry{e.addr, e.expiresAt, e.deleted}
+		pos += e.size
+	}
+
+	for key, e := range latest {
+		if e.deleted {
+			continue
+		}
+		if e.expiresAt > 0 && now.After(time.Unix(0, e.expiresAt)) {
+			continue
+		}
+		if !fn(key, e.addr, e.expiresAt) {
+			return nil
+		}
+	}
+	return nil
+}
+
+// forEachLarge is the memory-safe path for large indexes: it iterates every
+// bucket slot (via mmap — zero syscall) and walks each chain from HEAD
+// (newest) to tail.  Because entries are prepended on write, the first
+// occurrence of a key in a chain is always its newest version.
+// RAM: O(max chain depth) — a small []string reused per slot.
+func (hi *hashIndex) forEachLarge(now time.Time, fn func(key string, addr NeedleAddr, expiresAt int64) bool) error {
+	nowNs := now.UnixNano()
+	seen := make([]string, 0, 8) // reused per slot
 
 	for slot := uint64(0); slot < hi.bucketCount; slot++ {
 		boff := hi.bucketBase + int64(slot)*8
@@ -401,8 +452,6 @@ func (hi *hashIndex) ForEach(now time.Time, fn func(key string, addr NeedleAddr,
 				return fmt.Errorf("hash index ForEach at %d: %w", off, err)
 			}
 
-			// First occurrence in the chain = newest entry for this key.
-			// (Entries are prepended so HEAD is always newest.)
 			alreadySeen := false
 			for _, k := range seen {
 				if k == e.key {

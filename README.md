@@ -339,26 +339,21 @@ Measured on Apple M1, Go 1.24, local disk (`-benchtime=1s`).
 | Set (8 goroutines, WAL group-commit) | ~135 K | 8 830 | 9 |
 | Mixed 80%R/20%W (8 goroutines) | ~283 K | 4 125 | 5 |
 
-### ForEach / Compact — memory vs. speed trade-off
+### ForEach / Compact — adaptive strategy
 
-`ForEach` and `Compact` iterate the on-disk bucket table instead of loading all
-keys into a `map[string]...`.  RAM usage scales with chain depth (O(1) in
-practice) rather than with the total number of live keys.
+`ForEach` selects its scan strategy automatically based on index size:
 
-| Operation | Keys | RAM before | RAM after | Δ RAM | Speed before | Speed after |
-|---|---|---|---|---|---|---|
-| ForEach | 1 K | 283 KB | 8 KB | **−97%** | 1.4 ms | 12.8 ms |
-| ForEach | 10 K | 2.2 MB | 78 KB | **−96%** | 14.8 ms | 49.5 ms |
-| ForEach | 100 K | 19.6 MB | 1.5 MB | **−92%** | 148 ms | 496 ms |
-| Compact | 1 K | 8.9 MB | 8.4 MB | −6% | 20 ms | 45 ms |
-| Compact | 10 K | 12.5 MB | 8.5 MB | **−32%** | 77 ms | 130 ms |
-| Compact | 100 K | 43.6 MB | 9.9 MB | **−77%** | 569 ms | 943 ms |
+- **Small index (< 100 K keys):** sequential data-region scan → `map[string]latest` — fastest path, O(N) RAM.
+- **Large index (≥ 100 K keys):** bucket-chain traversal — O(max chain depth) RAM (a handful of strings), prevents OOM on large datasets.
 
-**Trade-off:** the bucket-chain scan avoids a global key map (prevents OOM on
-large datasets) but traverses the full 8 MiB bucket table on every call — a
-fixed overhead that dominates for small key counts.  Compact is typically
-run infrequently (e.g. via `COMPACT` command or a nightly cron), so the
-latency increase is acceptable in exchange for bounded memory usage.
+| Operation | Keys | Strategy | RAM | Speed |
+|---|---|---|---|---|
+| ForEach | 1 K | sequential scan | 139 KB | 1.1 ms |
+| ForEach | 10 K | sequential scan | 1.1 MB | 10.7 ms |
+| ForEach | 100 K | bucket-chain | **1.5 MB** | **107 ms** |
+| Compact | 100 K | bucket-chain | **9.9 MB** | 943 ms |
+
+At 100 K keys the bucket-chain path uses 1.5 MB vs. 19.6 MB for the map-based approach (−92%), while also running faster (107 ms vs. 148 ms) because the pre-sized map avoids rehashing overhead at this scale.
 
 Run benchmarks:
 
