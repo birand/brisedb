@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 
 	"github.com/birand/brisedb/pkg/volumeserver"
@@ -65,9 +66,16 @@ type BriseDB struct {
 	walPath     string
 	walCh       chan walMsg    // WAL write requests; consumed by walFlusher goroutine
 	walDone     chan struct{}  // closed by walFlusher after it drains and exits
+	walErr      atomic.Value  // stores the last *walError; read by writeWAL on fire-and-forget path
 	stopCh      chan struct{}
 	fsyncMode   FsyncMode
 }
+
+// walError wraps a WAL flush error so it can be stored in an atomic.Value
+// (which requires a consistent concrete type across all Store calls).
+type walError struct{ err error }
+
+func (e *walError) Error() string { return e.err.Error() }
 
 // DBOptions configures optional behaviour of NewBriseDB.
 type DBOptions struct {
@@ -327,19 +335,40 @@ func (db *BriseDB) Compact() error {
 	return nil
 }
 
-// writeWAL enqueues a WAL entry for the flusher goroutine and waits until
-// the entry has been written to disk. Value is stripped before writing.
+// writeWAL enqueues a WAL entry for the flusher goroutine.
+//
+// FsyncAlways: blocks until the batch containing this entry has been fsynced.
+// FsyncEverySec / FsyncNo (fire-and-forget): enqueues the entry and returns
+// immediately without waiting for flush.  This allows concurrent writers to
+// pipeline their WAL writes rather than serialising behind the flusher.
+// Flush errors are stored in db.walErr and returned to the next caller.
+//
+// Value is stripped before writing (only the key and needle address are
+// persisted; values live in volume files).
 func (db *BriseDB) writeWAL(op walEntry) error {
 	op.Value = "" // never persist value in WAL
 	data, err := json.Marshal(op)
 	if err != nil {
 		return fmt.Errorf("marshal WAL entry: %w", err)
 	}
-	done := make(chan error, 1)
-	db.walCh <- walMsg{data: data, done: done} // flusher appends the newline
-	if err := <-done; err != nil {
-		return fmt.Errorf("write WAL: %w", err)
+
+	if db.fsyncMode == FsyncAlways {
+		// Synchronous path: wait for the flusher to confirm durability.
+		done := make(chan error, 1)
+		db.walCh <- walMsg{data: data, done: done}
+		if err := <-done; err != nil {
+			return fmt.Errorf("write WAL: %w", err)
+		}
+		return nil
 	}
+
+	// Fire-and-forget path (FsyncEverySec / FsyncNo):
+	// Return any sticky error from the previous flush failure first.
+	if v := db.walErr.Load(); v != nil {
+		db.walErr.Store((*walError)(nil)) // clear so the next write has a chance
+		return fmt.Errorf("write WAL: %w", v.(*walError).err)
+	}
+	db.walCh <- walMsg{data: data} // done is nil — flusher will not signal
 	return nil
 }
 
@@ -373,6 +402,20 @@ func (db *BriseDB) walFlusher() {
 		err := currentFile.Sync()
 		pendingSync = false
 		return err
+	}
+
+	// signalBatch notifies waiting callers and, for fire-and-forget entries
+	// (done == nil), stores any error in db.walErr so the next writeWAL call
+	// can surface it.
+	signalBatch := func(batch []walMsg, err error) {
+		for _, m := range batch {
+			if m.done != nil {
+				m.done <- err
+			}
+		}
+		if err != nil {
+			db.walErr.Store(&walError{err})
+		}
 	}
 
 	flushBatch := func(batch []walMsg) error {
@@ -453,9 +496,7 @@ func (db *BriseDB) walFlusher() {
 					}
 				default:
 					err := flushBatch(batch)
-					for _, m := range batch {
-						m.done <- err
-					}
+					signalBatch(batch, err)
 					// Final fsync on shutdown regardless of mode.
 					if err == nil {
 						currentFile.Sync() //nolint:errcheck
@@ -473,9 +514,7 @@ func (db *BriseDB) walFlusher() {
 				if msg.newFile != nil || len(msg.data) == 0 {
 					// Flush current batch first, then handle the special msg.
 					err := flushBatch(batch)
-					for _, m := range batch {
-						m.done <- err
-					}
+					signalBatch(batch, err)
 					batch = nil
 					handleSpecial(msg)
 					break drain
@@ -490,9 +529,7 @@ func (db *BriseDB) walFlusher() {
 			continue
 		}
 		err := flushBatch(batch)
-		for _, m := range batch {
-			m.done <- err
-		}
+		signalBatch(batch, err)
 	}
 }
 
