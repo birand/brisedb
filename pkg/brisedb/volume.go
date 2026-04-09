@@ -102,20 +102,19 @@ func (v *volume) writeStream(r io.Reader, size int64) (NeedleAddr, error) {
 }
 
 func (v *volume) read(addr NeedleAddr) ([]byte, error) {
-	var hdr [8]byte
-	if _, err := v.f.ReadAt(hdr[:], int64(addr.Offset)); err != nil {
-		return nil, fmt.Errorf("volume %d: read header at %d: %w", v.id, addr.Offset, err)
+	// Single pread: read header + payload in one call.
+	// addr.Size is trusted from the hash index (written atomically on Set),
+	// so we don't need a separate header read.  We still verify the header
+	// to detect file corruption.
+	buf := make([]byte, 8+addr.Size)
+	if _, err := v.f.ReadAt(buf, int64(addr.Offset)); err != nil {
+		return nil, fmt.Errorf("volume %d: read at %d: %w", v.id, addr.Offset, err)
 	}
-	size := binary.BigEndian.Uint64(hdr[:])
-	if size != addr.Size {
+	if size := binary.BigEndian.Uint64(buf[:8]); size != addr.Size {
 		return nil, fmt.Errorf("volume %d: size mismatch at %d: index=%d file=%d",
 			v.id, addr.Offset, addr.Size, size)
 	}
-	buf := make([]byte, size)
-	if _, err := v.f.ReadAt(buf, int64(addr.Offset)+8); err != nil {
-		return nil, fmt.Errorf("volume %d: read data at %d: %w", v.id, addr.Offset, err)
-	}
-	return buf, nil
+	return buf[8:], nil
 }
 
 func (v *volume) size() uint64 {

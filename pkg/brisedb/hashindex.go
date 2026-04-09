@@ -245,37 +245,63 @@ type idxEntry struct {
 	size      int64 // total encoded size (for scanning)
 }
 
+// entryReadAheadSize is the number of bytes read in a single pread for
+// readEntryAt.  It covers entries whose key is up to 214 bytes long without
+// needing a second read (10 header + 214 key + 29 fixed tail = 253 ≤ 256).
+const entryReadAheadSize = 256
+
 func (hi *hashIndex) readEntryAt(pos int64) (idxEntry, error) {
-	// Read fixed prefix: next(8) + key_len(2) = 10 bytes
-	var prefix [10]byte
-	if _, err := hi.f.ReadAt(prefix[:], pos); err != nil {
-		return idxEntry{}, fmt.Errorf("hash index read prefix at %d: %w", pos, err)
-	}
-	next := int64(binary.LittleEndian.Uint64(prefix[0:8]))
-	keyLen := int(binary.LittleEndian.Uint16(prefix[8:10]))
-
-	need := keyLen + 4 + 8 + 8 + 8 + 1
+	// Single pread — read up to entryReadAheadSize bytes.  For keys ≤ 214 bytes
+	// this avoids a second syscall entirely (fast path).  Larger keys fall back
+	// to a targeted second read (slow path).
 	bp := indexEntryBufPool.Get().(*[]byte)
-	if cap(*bp) < need {
-		*bp = make([]byte, need)
+	if cap(*bp) < entryReadAheadSize {
+		*bp = make([]byte, entryReadAheadSize)
 	} else {
-		*bp = (*bp)[:need]
+		*bp = (*bp)[:entryReadAheadSize]
 	}
-	tail := *bp
-	if _, err := hi.f.ReadAt(tail, pos+10); err != nil {
+	n, err := hi.f.ReadAt(*bp, pos)
+	if n < 10 {
 		indexEntryBufPool.Put(bp)
-		return idxEntry{}, fmt.Errorf("hash index read tail at %d: %w", pos, err)
+		if err != nil {
+			return idxEntry{}, fmt.Errorf("hash index read at %d: %w", pos, err)
+		}
+		return idxEntry{}, fmt.Errorf("hash index short read at %d: got %d bytes", pos, n)
 	}
-	o := 0
-	key := string(tail[o : o+keyLen]); o += keyLen // string() copies bytes
-	volID := binary.LittleEndian.Uint32(tail[o:]); o += 4
-	offset := binary.LittleEndian.Uint64(tail[o:]); o += 8
-	sz := binary.LittleEndian.Uint64(tail[o:]); o += 8
-	expiresAt := int64(binary.LittleEndian.Uint64(tail[o:])); o += 8
-	deleted := tail[o] != 0
-	indexEntryBufPool.Put(bp)
 
+	b := (*bp)[:n]
+	next := int64(binary.LittleEndian.Uint64(b[0:8]))
+	keyLen := int(binary.LittleEndian.Uint16(b[8:10]))
 	totalSize := int64(8 + 2 + keyLen + 4 + 8 + 8 + 8 + 1)
+
+	var full []byte
+	if int64(n) >= totalSize {
+		// Fast path: entire entry is already in the buffer.
+		full = b[:totalSize]
+	} else {
+		// Slow path: entry didn't fit (key > 214 bytes).  Read the exact size.
+		fb := make([]byte, totalSize)
+		copy(fb, b[:n])
+		indexEntryBufPool.Put(bp)
+		bp = nil
+		if _, err := hi.f.ReadAt(fb[n:], pos+int64(n)); err != nil {
+			return idxEntry{}, fmt.Errorf("hash index read tail at %d: %w", pos, err)
+		}
+		full = fb
+	}
+
+	o := 10
+	key := string(full[o : o+keyLen]); o += keyLen // string() copies bytes
+	volID := binary.LittleEndian.Uint32(full[o:]); o += 4
+	offset := binary.LittleEndian.Uint64(full[o:]); o += 8
+	sz := binary.LittleEndian.Uint64(full[o:]); o += 8
+	expiresAt := int64(binary.LittleEndian.Uint64(full[o:])); o += 8
+	deleted := full[o] != 0
+
+	if bp != nil {
+		indexEntryBufPool.Put(bp)
+	}
+
 	return idxEntry{
 		next:      next,
 		key:       key,
