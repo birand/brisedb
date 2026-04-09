@@ -136,21 +136,27 @@ func (s *Session) RollbackTransaction() error {
 // Expired keys are treated as absent.
 func (s *Session) Get(key string) (string, bool) {
 	s.db.mu.RLock(key)
-	defer s.db.mu.RUnlock(key)
 
 	// Check transaction stack first (in-memory, no disk I/O)
 	tx := s.transactions.Peek()
 	for tx != nil {
 		if tx.deleted[key] {
+			s.db.mu.RUnlock(key)
 			return "", false
 		}
 		if val, ok := tx.store[key]; ok {
+			s.db.mu.RUnlock(key)
 			return val, true
 		}
 		tx = tx.next
 	}
 
 	addr, expiresAt, ok := s.db.hindex.Get(key)
+	// Release shard lock before disk I/O — NeedleAddr is stable (volumes are append-only,
+	// addresses are never invalidated) so it is safe to read the volume without holding
+	// the lock. This prevents long-held RLocks from blocking concurrent writers.
+	s.db.mu.RUnlock(key)
+
 	if !ok {
 		return "", false
 	}

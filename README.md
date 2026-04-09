@@ -336,8 +336,9 @@ Measured on Apple M1, Go 1.24, local disk (`-benchtime=1s`).
 | HashIndex Set | ~310 K | 3 544 | 1 |
 | HashIndex Get | ~1 M | 1 041 | 1 |
 | HashIndex GetMiss | ~84 M | 14 | 0 |
-| Set (8 goroutines, WAL group-commit) | ~960 K | 10 724 | 7 |
-| Mixed 80%R/20%W (8 goroutines) | ~283 K | 4 125 | 5 |
+| Set (8 goroutines, WAL group-commit) | ~650 K | 12 270 | 7 |
+| Get (8 goroutines) | ~270 K | 3 705 | 3 |
+| Mixed 80%R/20%W (8 goroutines) | ~179 K | 5 609 | 5 |
 
 ### ForEach / Compact — adaptive strategy
 
