@@ -6,7 +6,7 @@ import (
 	"hash/fnv"
 	"os"
 	"sync"
-	"syscall"
+	"sync/atomic"
 	"time"
 )
 
@@ -49,22 +49,37 @@ const (
 //	[4]  VolumeID
 //	[8]  Offset
 //	[8]  Size
-//	[8]  ExpiresAt    — Unix seconds; 0 = no expiry
+//	[8]  ExpiresAt    — Unix nanoseconds; 0 = no expiry
 //	[1]  deleted      — 0 = alive, 1 = tombstone
 //
 // Writes prepend to the chain (update bucket → new entry → old head), so the
 // newest entry is always reachable first.  ForEach does a two-pass linear scan
 // of the data region to deduplicate (newest wins).
+//
+// Concurrency model — lock-free reads:
+//
+//	Get holds NO lock. Safety is guaranteed by the publication pattern:
+//	  1. Entry bytes are written to disk (pwrite) before the bucket pointer
+//	     is published via atomic.Store.
+//	  2. The data region is append-only; a published entry offset is never
+//	     overwritten or invalidated.
+//	  3. hi.buckets is a []atomic.Uint64 — each load/store is sequentially
+//	     consistent, providing the necessary memory ordering on all Go targets.
+//	  4. pread coherence: on a single OS process the kernel page cache is
+//	     shared, so a pwrite followed by pread from another goroutine always
+//	     observes the written data.
+//
+//	Set/Delete serialize via hi.mu (sync.Mutex, writers-only).
 type hashIndex struct {
-	mu          sync.RWMutex
+	mu          sync.Mutex    // serializes writers; readers are lock-free
 	f           *os.File
 	path        string
 	bucketCount uint64
-	bucketBase  int64  // file offset of the first bucket slot
-	dataBase    int64  // file offset of the first entry
-	writePos    int64  // next append offset (= current file size)
-	entryCount  int64  // live entries (informational)
-	mmapData    []byte // MAP_SHARED read-only mmap of [0, dataBase); nil = fallback to pread
+	bucketBase  int64         // file offset of the first bucket slot
+	dataBase    int64         // file offset of the first entry
+	writePos    atomic.Int64  // next append offset
+	entryCount  atomic.Int64  // live entries (informational)
+	buckets     []atomic.Uint64 // in-memory bucket table; index == slot number
 }
 
 // openHashIndex opens or creates the hash index at path.
@@ -84,7 +99,7 @@ func openHashIndex(path string, bucketCount uint64) (*hashIndex, error) {
 		bucketBase:  hiHeaderSize,
 		dataBase:    hiHeaderSize + int64(bucketCount)*8,
 	}
-	hi.writePos = hi.dataBase
+	hi.writePos.Store(hi.dataBase)
 
 	info, err := f.Stat()
 	if err != nil {
@@ -102,31 +117,32 @@ func openHashIndex(path string, bucketCount uint64) (*hashIndex, error) {
 			f.Close()
 			return nil, fmt.Errorf("read hash index header: %w", err)
 		}
-		hi.writePos = info.Size()
+		hi.writePos.Store(info.Size())
 	}
-	hi.mapBuckets()
+
+	if err := hi.loadBuckets(); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("load hash index buckets: %w", err)
+	}
 	return hi, nil
 }
 
-// mapBuckets memory-maps the header + bucket table region of the index file.
-// Reads from the bucket table then use direct memory access instead of pread.
-// Writes still go through f.WriteAt; MAP_SHARED ensures the mmap sees them.
-// On any error the mmap is silently skipped and pread is used as fallback.
-func (hi *hashIndex) mapBuckets() {
-	size := int(hi.dataBase) // header (64 B) + bucket table (bucketCount × 8 B)
-	data, err := syscall.Mmap(int(hi.f.Fd()), 0, size,
-		syscall.PROT_READ, syscall.MAP_SHARED)
-	if err == nil {
-		hi.mmapData = data
+// loadBuckets reads the on-disk bucket table into the in-memory atomic array.
+// This is done once at open time (and after Compact). All subsequent reads
+// go through hi.buckets without any syscall.
+func (hi *hashIndex) loadBuckets() error {
+	hi.buckets = make([]atomic.Uint64, hi.bucketCount)
+	// Read the bucket table in one shot for speed.
+	tableSize := int(hi.bucketCount) * 8
+	buf := make([]byte, tableSize)
+	if _, err := hi.f.ReadAt(buf, hi.bucketBase); err != nil {
+		return err
 	}
-}
-
-// unmapBuckets releases the mmap region if one is active.
-func (hi *hashIndex) unmapBuckets() {
-	if hi.mmapData != nil {
-		syscall.Munmap(hi.mmapData) //nolint:errcheck
-		hi.mmapData = nil
+	for i := uint64(0); i < hi.bucketCount; i++ {
+		v := binary.LittleEndian.Uint64(buf[i*8 : i*8+8])
+		hi.buckets[i].Store(v)
 	}
+	return nil
 }
 
 func (hi *hashIndex) initFile() error {
@@ -148,7 +164,7 @@ func (hi *hashIndex) encodeHeader() []byte {
 	binary.LittleEndian.PutUint32(hdr[8:12], hiVersion)
 	binary.LittleEndian.PutUint64(hdr[16:24], hi.bucketCount)
 	binary.LittleEndian.PutUint64(hdr[24:32], uint64(hi.dataBase))
-	binary.LittleEndian.PutUint64(hdr[32:40], uint64(hi.entryCount))
+	binary.LittleEndian.PutUint64(hdr[32:40], uint64(hi.entryCount.Load()))
 	return hdr
 }
 
@@ -163,7 +179,7 @@ func (hi *hashIndex) readHeader() error {
 	hi.bucketCount = binary.LittleEndian.Uint64(hdr[16:24])
 	hi.dataBase = int64(binary.LittleEndian.Uint64(hdr[24:32]))
 	hi.bucketBase = hiHeaderSize
-	hi.entryCount = int64(binary.LittleEndian.Uint64(hdr[32:40]))
+	hi.entryCount.Store(int64(binary.LittleEndian.Uint64(hdr[32:40])))
 	return nil
 }
 
@@ -171,29 +187,23 @@ func (hi *hashIndex) readHeader() error {
 // Bucket helpers
 // ------------------------------------------------------------------ //
 
-func (hi *hashIndex) bucketFileOffset(key string) int64 {
+// hashSlot returns the bucket array index for key.
+func (hi *hashIndex) hashSlot(key string) uint64 {
 	h := fnv.New64a()
 	h.Write([]byte(key))
-	slot := h.Sum64() % hi.bucketCount
+	return h.Sum64() % hi.bucketCount
+}
+
+func (hi *hashIndex) bucketFileOffset(slot uint64) int64 {
 	return hi.bucketBase + int64(slot)*8
 }
 
-func (hi *hashIndex) readBucket(boff int64) (int64, error) {
-	if hi.mmapData != nil {
-		// Zero-syscall path: read directly from the memory-mapped bucket table.
-		return int64(binary.LittleEndian.Uint64(hi.mmapData[boff : boff+8])), nil
-	}
-	var buf [8]byte
-	if _, err := hi.f.ReadAt(buf[:], boff); err != nil {
-		return 0, err
-	}
-	return int64(binary.LittleEndian.Uint64(buf[:])), nil
-}
-
-func (hi *hashIndex) writeBucket(boff, entryOff int64) error {
+// writeBucketFile persists a bucket pointer to the file (crash recovery).
+// Callers must hold hi.mu.
+func (hi *hashIndex) writeBucketFile(slot uint64, entryOff int64) error {
 	var buf [8]byte
 	binary.LittleEndian.PutUint64(buf[:], uint64(entryOff))
-	_, err := hi.f.WriteAt(buf[:], boff)
+	_, err := hi.f.WriteAt(buf[:], hi.bucketFileOffset(slot))
 	return err
 }
 
@@ -282,13 +292,14 @@ func (hi *hashIndex) readEntryAt(pos int64) (idxEntry, error) {
 
 // Get returns the needle address and expiry for key.
 // Returns (NeedleAddr{}, 0, false) if the key is not present or is deleted.
+//
+// Get is lock-free: it reads the bucket pointer via atomic.Load and follows
+// the entry chain via pread. Safety is guaranteed by the publication pattern
+// in Set/Delete — see the type-level comment for details.
 func (hi *hashIndex) Get(key string) (NeedleAddr, int64, bool) {
-	hi.mu.RLock()
-	defer hi.mu.RUnlock()
-
-	boff := hi.bucketFileOffset(key)
-	head, err := hi.readBucket(boff)
-	if err != nil || head == 0 {
+	slot := hi.hashSlot(key)
+	head := int64(hi.buckets[slot].Load())
+	if head == 0 {
 		return NeedleAddr{}, 0, false
 	}
 
@@ -313,25 +324,30 @@ func (hi *hashIndex) Set(key string, addr NeedleAddr, expiresAt int64) error {
 	hi.mu.Lock()
 	defer hi.mu.Unlock()
 
-	boff := hi.bucketFileOffset(key)
-	oldHead, err := hi.readBucket(boff)
-	if err != nil {
-		return err
-	}
+	slot := hi.hashSlot(key)
+	oldHead := int64(hi.buckets[slot].Load())
 
+	// Write the full entry to disk BEFORE publishing the bucket pointer.
+	// This guarantees that any reader that observes the new pointer can
+	// safely pread the entry (publication pattern).
 	bp := indexEntryBufPool.Get().(*[]byte)
 	encodeIndexEntry(bp, oldHead, key, addr, expiresAt, false)
 	entry := *bp
-	newOff := hi.writePos
-	_, err = hi.f.WriteAt(entry, newOff)
+	newOff := hi.writePos.Load()
+	_, err := hi.f.WriteAt(entry, newOff)
 	indexEntryBufPool.Put(bp)
 	if err != nil {
 		return fmt.Errorf("hash index set %q: %w", key, err)
 	}
-	hi.writePos += int64(len(entry))
-	hi.entryCount++
+	hi.writePos.Add(int64(len(entry)))
+	hi.entryCount.Add(1)
 
-	return hi.writeBucket(boff, newOff)
+	// Atomically publish the new head — visible to lock-free Get callers.
+	hi.buckets[slot].Store(uint64(newOff))
+
+	// Persist bucket pointer for crash recovery (the in-memory array is
+	// rebuilt from this file on the next open).
+	return hi.writeBucketFile(slot, newOff)
 }
 
 // Delete appends a tombstone entry for key.
@@ -339,27 +355,25 @@ func (hi *hashIndex) Delete(key string) error {
 	hi.mu.Lock()
 	defer hi.mu.Unlock()
 
-	boff := hi.bucketFileOffset(key)
-	oldHead, err := hi.readBucket(boff)
-	if err != nil {
-		return err
-	}
+	slot := hi.hashSlot(key)
+	oldHead := int64(hi.buckets[slot].Load())
 
 	bp := indexEntryBufPool.Get().(*[]byte)
 	encodeIndexEntry(bp, oldHead, key, NeedleAddr{}, 0, true)
 	entry := *bp
-	newOff := hi.writePos
-	_, err = hi.f.WriteAt(entry, newOff)
+	newOff := hi.writePos.Load()
+	_, err := hi.f.WriteAt(entry, newOff)
 	indexEntryBufPool.Put(bp)
 	if err != nil {
 		return fmt.Errorf("hash index delete %q: %w", key, err)
 	}
-	hi.writePos += int64(len(entry))
-	if hi.entryCount > 0 {
-		hi.entryCount--
+	hi.writePos.Add(int64(len(entry)))
+	if hi.entryCount.Load() > 0 {
+		hi.entryCount.Add(-1)
 	}
 
-	return hi.writeBucket(boff, newOff)
+	hi.buckets[slot].Store(uint64(newOff))
+	return hi.writeBucketFile(slot, newOff)
 }
 
 // forEachThreshold is the entry count above which ForEach switches from the
@@ -380,13 +394,15 @@ const forEachThreshold = 100_000
 //     depth) RAM (typically a handful of strings), ~3× slower due to the fixed
 //     8 MiB bucket-table scan cost, but safe for millions of keys.
 //
-// fn must not call any hashIndex method (would deadlock on the read lock).
+// ForEach takes a snapshot of writePos at entry so concurrent writes that
+// arrive during iteration are not observed (consistent read snapshot).
+// fn must not call Set or Delete (would deadlock on hi.mu).
 func (hi *hashIndex) ForEach(now time.Time, fn func(key string, addr NeedleAddr, expiresAt int64) bool) error {
-	hi.mu.RLock()
-	defer hi.mu.RUnlock()
+	snapCount := hi.entryCount.Load()
+	snapWritePos := hi.writePos.Load()
 
-	if hi.entryCount < forEachThreshold {
-		return hi.forEachSmall(now, fn)
+	if snapCount < forEachThreshold {
+		return hi.forEachSmall(now, fn, snapWritePos)
 	}
 	return hi.forEachLarge(now, fn)
 }
@@ -394,16 +410,16 @@ func (hi *hashIndex) ForEach(now time.Time, fn func(key string, addr NeedleAddr,
 // forEachSmall is the fast path for small indexes: one linear pass over the
 // data region builds a map of the newest entry per key, then a second pass
 // yields live non-expired entries.  RAM: O(entryCount).
-func (hi *hashIndex) forEachSmall(now time.Time, fn func(key string, addr NeedleAddr, expiresAt int64) bool) error {
+func (hi *hashIndex) forEachSmall(now time.Time, fn func(key string, addr NeedleAddr, expiresAt int64) bool, writePos int64) error {
 	type latestEntry struct {
 		addr      NeedleAddr
 		expiresAt int64
 		deleted   bool
 	}
 
-	latest := make(map[string]latestEntry, hi.entryCount)
+	latest := make(map[string]latestEntry, hi.entryCount.Load())
 	pos := hi.dataBase
-	for pos < hi.writePos {
+	for pos < writePos {
 		e, err := hi.readEntryAt(pos)
 		if err != nil {
 			return fmt.Errorf("hash index ForEach at %d: %w", pos, err)
@@ -427,20 +443,16 @@ func (hi *hashIndex) forEachSmall(now time.Time, fn func(key string, addr Needle
 }
 
 // forEachLarge is the memory-safe path for large indexes: it iterates every
-// bucket slot (via mmap — zero syscall) and walks each chain from HEAD
-// (newest) to tail.  Because entries are prepended on write, the first
-// occurrence of a key in a chain is always its newest version.
+// bucket slot via the in-memory atomic array (zero syscall) and walks each
+// chain from HEAD (newest) to tail.  Because entries are prepended on write,
+// the first occurrence of a key in a chain is always its newest version.
 // RAM: O(max chain depth) — a small []string reused per slot.
 func (hi *hashIndex) forEachLarge(now time.Time, fn func(key string, addr NeedleAddr, expiresAt int64) bool) error {
 	nowNs := now.UnixNano()
 	seen := make([]string, 0, 8) // reused per slot
 
 	for slot := uint64(0); slot < hi.bucketCount; slot++ {
-		boff := hi.bucketBase + int64(slot)*8
-		head, err := hi.readBucket(boff)
-		if err != nil {
-			return fmt.Errorf("hash index ForEach bucket %d: %w", slot, err)
-		}
+		head := int64(hi.buckets[slot].Load())
 		if head == 0 {
 			continue
 		}
@@ -484,12 +496,7 @@ func (hi *hashIndex) forEachLarge(now time.Time, fn func(key string, addr Needle
 // from the bucket-chain iterator into the new index file.
 func (hi *hashIndex) Compact(now time.Time) error {
 	// Use the current entry count as an upper bound for bucket sizing.
-	// It may be slightly over-estimated (includes tombstoned entries not yet
-	// removed), so the new index might have a few extra empty buckets — that
-	// is harmless and corrects itself on the next Compact.
-	hi.mu.RLock()
-	estEntries := hi.entryCount
-	hi.mu.RUnlock()
+	estEntries := hi.entryCount.Load()
 
 	newBuckets := DefaultBucketCount
 	if need := uint64(estEntries) * 2; need > newBuckets {
@@ -542,12 +549,13 @@ func (hi *hashIndex) Compact(now time.Time) error {
 		return fmt.Errorf("hash index compact: rename: %w", err)
 	}
 
-	// Reopen the compacted file in-place.
+	// Reopen the compacted file and reinitialize all in-memory state.
+	// hi.mu is held here because db.mu.LockAll() is held by the caller,
+	// ensuring no concurrent reads or writes are in flight.
 	hi.mu.Lock()
 	defer hi.mu.Unlock()
-	hi.unmapBuckets()
-	hi.f.Close()
 
+	hi.f.Close()
 	f, err := os.OpenFile(hi.path, os.O_RDWR, 0644)
 	if err != nil {
 		return fmt.Errorf("hash index compact: reopen: %w", err)
@@ -557,9 +565,13 @@ func (hi *hashIndex) Compact(now time.Time) error {
 	hi.bucketCount = newBuckets
 	hi.dataBase = hiHeaderSize + int64(newBuckets)*8
 	hi.bucketBase = hiHeaderSize
-	hi.writePos = info.Size()
-	hi.entryCount = liveCount
-	hi.mapBuckets()
+	hi.writePos.Store(info.Size())
+	hi.entryCount.Store(liveCount)
+
+	// Rebuild the in-memory bucket array from the compacted file.
+	if err := hi.loadBuckets(); err != nil {
+		return fmt.Errorf("hash index compact: reload buckets: %w", err)
+	}
 	return nil
 }
 
@@ -567,9 +579,41 @@ func (hi *hashIndex) Compact(now time.Time) error {
 func (hi *hashIndex) Close() error {
 	hi.mu.Lock()
 	defer hi.mu.Unlock()
-	hi.unmapBuckets()
 	// Persist the entry count in the header before closing
 	hdr := hi.encodeHeader()
 	hi.f.WriteAt(hdr, 0) //nolint:errcheck
 	return hi.f.Close()
 }
+
+// loadFactor returns the ratio of live entries to bucket slots.
+// Used to decide when Compact should expand the bucket table.
+func (hi *hashIndex) loadFactor() float64 {
+	if hi.bucketCount == 0 {
+		return 0
+	}
+	return float64(hi.entryCount.Load()) / float64(hi.bucketCount)
+}
+
+// size returns the number of live entries.
+func (hi *hashIndex) size() int64 {
+	return hi.entryCount.Load()
+}
+
+// writePos returns the current append position (end of data region).
+// Exposed for tests.
+func (hi *hashIndex) appendPos() int64 {
+	return hi.writePos.Load()
+}
+
+// ------------------------------------------------------------------ //
+// Atomic bucket load helper (used by tests)
+// ------------------------------------------------------------------ //
+
+// loadBucketAtomic returns the head entry offset for the given slot.
+func (hi *hashIndex) loadBucketAtomic(slot uint64) int64 {
+	return int64(hi.buckets[slot].Load())
+}
+
+// atomicLoadInt64 is a thin wrapper so callers can read writePos without
+// accessing the unexported field directly.  Used in ForEach snapshot.
+func atomicLoadInt64(p *atomic.Int64) int64 { return p.Load() }

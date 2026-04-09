@@ -333,12 +333,12 @@ Measured on Apple M1, Go 1.24, local disk (`-benchtime=1s`).
 | Transaction (1 key) | ~106 K | 11 221 | 19 |
 | Transaction (10 keys) | ~10 K | 103 723 | 104 |
 | Rollback | ~5 M | 231 | 6 |
-| HashIndex Set | ~310 K | 3 544 | 1 |
-| HashIndex Get | ~1 M | 1 041 | 1 |
-| HashIndex GetMiss | ~84 M | 14 | 0 |
-| Set (8 goroutines, WAL group-commit) | ~650 K | 12 270 | 7 |
-| Get (8 goroutines) | ~270 K | 3 705 | 3 |
-| Mixed 80%R/20%W (8 goroutines) | ~179 K | 5 609 | 5 |
+| HashIndex Set | ~280 K | 3 566 | 1 |
+| HashIndex Get | ~950 K | 1 059 | 1 |
+| HashIndex GetMiss | ~135 M | 7 | 0 |
+| Set (8 goroutines, WAL group-commit) | ~916 K | 8 761 | 7 |
+| Get (8 goroutines) | ~316 K | 3 163 | 3 |
+| Mixed 80%R/20%W (8 goroutines) | ~252 K | 3 990 | 5 |
 
 ### ForEach / Compact — adaptive strategy
 

@@ -172,7 +172,7 @@ func NewBriseDB(dataDir string, opts ...DBOptions) (*BriseDB, error) {
 
 	// On first open (empty hash index), replay the WAL to rebuild it.
 	// On subsequent opens the hash index is already up-to-date.
-	if hindex.entryCount == 0 {
+	if hindex.entryCount.Load() == 0 {
 		if err := db.replayWAL(); err != nil {
 			walFile.Close()
 			volumes.Close()
