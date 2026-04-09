@@ -319,7 +319,7 @@ Measured on Apple M1, Go 1.24, local disk (`-benchtime=1s`).
 
 | Benchmark | ops/s | ns/op | allocs/op |
 |---|---|---|---|
-| Set (single key, WAL flush) | ~92 K | 10 821 | 10 |
+| Set (single key, WAL flush) | ~109 K | 9 221 | 7 |
 | Get (cache miss) | ~568 K | 2 143 | 3 |
 | Get (miss / not found) | ~42 M | 28 | 0 |
 | Delete | ~691 K | 1 482 | 3 |
@@ -336,7 +336,7 @@ Measured on Apple M1, Go 1.24, local disk (`-benchtime=1s`).
 | HashIndex Set | ~310 K | 3 544 | 1 |
 | HashIndex Get | ~1 M | 1 041 | 1 |
 | HashIndex GetMiss | ~84 M | 14 | 0 |
-| Set (8 goroutines, WAL group-commit) | ~135 K | 8 830 | 9 |
+| Set (8 goroutines, WAL group-commit) | ~960 K | 10 724 | 7 |
 | Mixed 80%R/20%W (8 goroutines) | ~283 K | 4 125 | 5 |
 
 ### ForEach / Compact — adaptive strategy
